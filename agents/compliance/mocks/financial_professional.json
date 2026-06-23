@@ -1,0 +1,48 @@
+{
+    "client_profile": {
+        "persona": "financial_professional",
+        "age": 35,
+        "risk_tolerance": "aggressive",
+        "time_horizon_years": 20,
+        "liquidity_needs": "low",
+        "investment_objective": "growth"
+    },
+    "human_capital": {
+        "industry": "finance",
+        "income_stability": "medium",
+        "income_equity_correlation": 0.65,
+        "rsu_concentration": 0.05,
+        "human_capital_type": "equity-like",
+        "employer_sector": "financials",
+        "has_pension": false,
+        "estimated_hc_pv": 3500000.0
+    },
+    "macro_regime": {
+        "current_regime": "rate_hike",
+        "historical_analogue": "2004-2006",
+        "regime_risk_flags": ["rising rates", "credit tightening"],
+        "regime_confidence": 0.80,
+        "regime_volatility": "medium"
+    },
+    "proposed_portfolio": {
+        "VTI": 0.25,
+        "VXUS": 0.15,
+        "QQQ": 0.15,
+        "XLE": 0.10,
+        "BND": 0.15,
+        "GLD": 0.10,
+        "CASH": 0.10
+    },
+    "allocation_rationale": {
+        "VTI": "Core US equity allocation for long-term growth aligned with aggressive risk tolerance and 20-year horizon",
+        "VXUS": "International diversification provides geographic hedging for a financial professional whose income is correlated with US markets",
+        "QQQ": "Growth-oriented tech exposure suitable for aggressive investor with long horizon, offset by low RSU concentration",
+        "XLE": "Energy sector provides diversification uncorrelated with client's finance industry income",
+        "BND": "Fixed income allocation to partially offset equity-like human capital in finance sector",
+        "GLD": "Gold allocation as portfolio hedge against rate hike regime and inflation risk",
+        "CASH": "Minimal liquidity buffer reflecting low liquidity needs"
+    },
+    "regime_change_flag": {
+        "detected": false
+    }
+}

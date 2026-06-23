@@ -1,0 +1,135 @@
+{
+    "portfolio_id": "bio_prof_v1",
+    "risk_decision": "PASS",
+    "regime_evaluation": {
+        "dot_com": {
+            "benchmark_drawdown": -0.44,
+            "drawdown_floor": -0.22,
+            "portfolio_drawdown": -0.18,
+            "passed": true
+        },
+        "gfc": {
+            "benchmark_drawdown": -0.51,
+            "drawdown_floor": -0.255,
+            "portfolio_drawdown": -0.24,
+            "passed": true
+        },
+        "covid": {
+            "benchmark_drawdown": -0.34,
+            "drawdown_floor": -0.17,
+            "portfolio_drawdown": -0.15,
+            "passed": true
+        },
+        "rate_hike": {
+            "benchmark_drawdown": -0.22,
+            "drawdown_floor": -0.11,
+            "portfolio_drawdown": -0.09,
+            "passed": true
+        },
+        "ai_boom": {
+            "benchmark_drawdown": -0.12,
+            "drawdown_floor": -0.06,
+            "portfolio_drawdown": -0.04,
+            "passed": true
+        }
+    },
+    "position_limits": {
+        "VTI": {
+            "derived_limit": 0.25,
+            "actual_weight": 0.20,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.15
+        },
+        "VXUS": {
+            "derived_limit": 0.20,
+            "actual_weight": 0.10,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.17
+        },
+        "BND": {
+            "derived_limit": 0.40,
+            "actual_weight": 0.30,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.05
+        },
+        "TIP": {
+            "derived_limit": 0.35,
+            "actual_weight": 0.15,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.06
+        },
+        "VNQ": {
+            "derived_limit": 0.15,
+            "actual_weight": 0.10,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.20
+        },
+        "CASH": {
+            "derived_limit": 0.50,
+            "actual_weight": 0.15,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.01
+        }
+    },
+    "sector_limits": {
+        "broad_market": {
+            "base_limit": 0.20,
+            "correlation_with_hc": 0.08,
+            "adjusted_limit": 0.184,
+            "actual_sector_weight": 0.20,
+            "passed": false
+        },
+        "international": {
+            "base_limit": 0.20,
+            "correlation_with_hc": 0.05,
+            "adjusted_limit": 0.19,
+            "actual_sector_weight": 0.10,
+            "passed": true
+        },
+        "bonds": {
+            "base_limit": 0.20,
+            "correlation_with_hc": -0.15,
+            "adjusted_limit": 0.23,
+            "actual_sector_weight": 0.45,
+            "passed": false
+        },
+        "real_estate": {
+            "base_limit": 0.20,
+            "correlation_with_hc": 0.12,
+            "adjusted_limit": 0.176,
+            "actual_sector_weight": 0.10,
+            "passed": true
+        },
+        "cash": {
+            "base_limit": 0.20,
+            "correlation_with_hc": 0.00,
+            "adjusted_limit": 0.20,
+            "actual_sector_weight": 0.15,
+            "passed": true
+        }
+    },
+    "violations": [
+        "Broad market at 20% slightly exceeds HC-adjusted limit of 18.4%",
+        "Bonds at 45% exceeds HC-adjusted limit of 23%"
+    ],
+    "warnings": [
+        "Bond allocation at 45% is high — may limit growth potential over 8-year horizon"
+    ],
+    "derivation": {
+        "drawdown_method": "benchmark_relative_per_regime",
+        "concentration_method": "marginal_risk_contribution",
+        "sector_method": "hc_correlation_adjusted",
+        "benchmark": "80/20 equity/bond",
+        "risk_tolerance": "conservative",
+        "tolerance_multiplier": 0.5,
+        "hc_type": "bond-like",
+        "rsu_concentration": 0.0,
+        "data_source": "CRSP daily returns 2000-2024"
+    }
+}

@@ -1,0 +1,12 @@
+pandas
+numpy
+matplotlib
+scikit-learn
+jupyter
+openai
+python-dotenv
+langchain
+langgraph
+pydantic>=2.0
+anthropic
+pytest

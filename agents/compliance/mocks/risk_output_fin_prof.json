@@ -1,0 +1,155 @@
+{
+    "portfolio_id": "fin_prof_v1",
+    "risk_decision": "PASS",
+    "regime_evaluation": {
+        "dot_com": {
+            "benchmark_drawdown": -0.44,
+            "drawdown_floor": -0.66,
+            "portfolio_drawdown": -0.42,
+            "passed": true
+        },
+        "gfc": {
+            "benchmark_drawdown": -0.51,
+            "drawdown_floor": -0.765,
+            "portfolio_drawdown": -0.46,
+            "passed": true
+        },
+        "covid": {
+            "benchmark_drawdown": -0.34,
+            "drawdown_floor": -0.51,
+            "portfolio_drawdown": -0.30,
+            "passed": true
+        },
+        "rate_hike": {
+            "benchmark_drawdown": -0.22,
+            "drawdown_floor": -0.33,
+            "portfolio_drawdown": -0.18,
+            "passed": true
+        },
+        "ai_boom": {
+            "benchmark_drawdown": -0.12,
+            "drawdown_floor": -0.18,
+            "portfolio_drawdown": -0.07,
+            "passed": true
+        }
+    },
+    "position_limits": {
+        "VTI": {
+            "derived_limit": 0.35,
+            "actual_weight": 0.25,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.15
+        },
+        "VXUS": {
+            "derived_limit": 0.25,
+            "actual_weight": 0.15,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.17
+        },
+        "QQQ": {
+            "derived_limit": 0.18,
+            "actual_weight": 0.15,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.32
+        },
+        "XLE": {
+            "derived_limit": 0.15,
+            "actual_weight": 0.10,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.25
+        },
+        "BND": {
+            "derived_limit": 0.45,
+            "actual_weight": 0.15,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.05
+        },
+        "GLD": {
+            "derived_limit": 0.20,
+            "actual_weight": 0.10,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.16
+        },
+        "CASH": {
+            "derived_limit": 0.50,
+            "actual_weight": 0.10,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.01
+        }
+    },
+    "sector_limits": {
+        "broad_market": {
+            "base_limit": 0.40,
+            "correlation_with_hc": 0.55,
+            "adjusted_limit": 0.18,
+            "actual_sector_weight": 0.25,
+            "passed": false
+        },
+        "international": {
+            "base_limit": 0.40,
+            "correlation_with_hc": 0.35,
+            "adjusted_limit": 0.26,
+            "actual_sector_weight": 0.15,
+            "passed": true
+        },
+        "technology": {
+            "base_limit": 0.40,
+            "correlation_with_hc": 0.50,
+            "adjusted_limit": 0.20,
+            "actual_sector_weight": 0.15,
+            "passed": true
+        },
+        "energy": {
+            "base_limit": 0.40,
+            "correlation_with_hc": 0.30,
+            "adjusted_limit": 0.28,
+            "actual_sector_weight": 0.10,
+            "passed": true
+        },
+        "bonds": {
+            "base_limit": 0.40,
+            "correlation_with_hc": -0.10,
+            "adjusted_limit": 0.44,
+            "actual_sector_weight": 0.15,
+            "passed": true
+        },
+        "commodities": {
+            "base_limit": 0.40,
+            "correlation_with_hc": 0.05,
+            "adjusted_limit": 0.38,
+            "actual_sector_weight": 0.10,
+            "passed": true
+        },
+        "cash": {
+            "base_limit": 0.40,
+            "correlation_with_hc": 0.00,
+            "adjusted_limit": 0.40,
+            "actual_sector_weight": 0.10,
+            "passed": true
+        }
+    },
+    "violations": [
+        "Broad market at 25% exceeds HC-adjusted limit of 18%"
+    ],
+    "warnings": [
+        "Bond allocation at 15% is low for equity-like human capital client — consider increasing to offset market-correlated income"
+    ],
+    "derivation": {
+        "drawdown_method": "benchmark_relative_per_regime",
+        "concentration_method": "marginal_risk_contribution",
+        "sector_method": "hc_correlation_adjusted",
+        "benchmark": "80/20 equity/bond",
+        "risk_tolerance": "aggressive",
+        "tolerance_multiplier": 1.5,
+        "hc_type": "equity-like",
+        "rsu_concentration": 0.05,
+        "data_source": "CRSP daily returns 2000-2024"
+    }
+}
