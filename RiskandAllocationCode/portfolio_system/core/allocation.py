@@ -32,11 +32,16 @@ def build_returns_matrix(
     Pivots CRSP monthly returns into a (T × N) DataFrame.
     Columns: tickers. Index: date. Values: monthly total return.
     Rows with any missing return are dropped.
+    Tickers with no PERMNO mapping are silently skipped.
     """
-    inv_map = {permno_map[t]: t for t in tickers}
+    available = [t for t in tickers if t in permno_map]
+    missing = set(tickers) - set(available)
+    if missing:
+        print(f"Warning: tickers not found in CRSP and dropped: {missing}")
+    inv_map = {permno_map[t]: t for t in available}
     subset  = crsp_monthly[crsp_monthly["permno"].isin(inv_map)].copy()
     subset["ticker"] = subset["permno"].map(inv_map)
-    pivot = subset.pivot(index="date", columns="ticker", values="ret")[tickers]
+    pivot = subset.pivot(index="date", columns="ticker", values="ret")[available]
     return pivot.dropna()
 
 
@@ -295,11 +300,14 @@ def run_allocation(
 
     # ── 1. Covariance ──
     returns_df      = build_returns_matrix(crsp_monthly, tickers, permno_map)
+    tickers         = list(returns_df.columns)   # restrict to tickers with CRSP data
     excess, ff_arr  = _align_and_excess(returns_df, ff_factors)
     cov             = build_covariance_matrix(excess)
 
     # ── 2. Equilibrium returns ──
-    mkt_w = np.array([universe.market_cap_weights[t] for t in tickers])
+    raw_w = {t: universe.market_cap_weights[t] for t in tickers}
+    total = sum(raw_w.values()) or 1.0
+    mkt_w = np.array([raw_w[t] / total for t in tickers])
     pi    = compute_equilibrium_returns(cov, mkt_w)
 
     # ── 3. FF views ──
