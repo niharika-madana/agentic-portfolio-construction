@@ -37,7 +37,13 @@ def _align_and_excess(
     returns: pd.DataFrame,
     ff_factors: pd.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray]:
-    joined = returns.join(ff_factors[["mktrf", "smb", "hml", "umd", "rf"]], how="inner")
+    # CRSP uses end-of-month dates; FF factors use start-of-month.
+    # Normalize both to month-start so the inner join finds overlapping months.
+    r = returns.copy()
+    r.index = r.index.to_period("M").to_timestamp()
+    f = ff_factors.copy()
+    f.index = f.index.to_period("M").to_timestamp()
+    joined = r.join(f[["mktrf", "smb", "hml", "umd", "rf"]], how="inner")
     rf     = joined["rf"].to_numpy(dtype=np.float64, na_value=np.nan)
     excess = joined[returns.columns].to_numpy(dtype=np.float64) - rf[:, None]
     ff_arr = joined[["mktrf", "smb", "hml", "umd"]].to_numpy(dtype=np.float64)

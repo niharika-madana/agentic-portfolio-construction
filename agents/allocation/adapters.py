@@ -27,8 +27,8 @@ DEFAULT_TICKERS: list[str] = [
     "SPY", "IWM", "EFA", "EEM",
     # Fixed income
     "AGG", "TLT", "IEF", "SHY", "HYG", "LQD", "TIP",
-    # Real assets
-    "GLD", "VNQ", "DJP",
+    # Real assets — DJP excluded (ETN, not in CRSP)
+    "GLD", "VNQ",
     # Sector ETFs
     "XLK", "XLF", "XLV", "XLE", "XLI", "XLC", "XLY", "XLP", "XLU", "XLRE",
     # Cash proxy
@@ -50,7 +50,6 @@ ETF_SECTORS: dict[str, str] = {
     "TIP":  "Fixed Income",
     "GLD":  "Real Assets",
     "VNQ":  "Real Estate",
-    "DJP":  "Real Assets",
     "XLK":  "Information Technology",
     "XLF":  "Financials",
     "XLV":  "Health Care",

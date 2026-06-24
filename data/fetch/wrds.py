@@ -82,7 +82,6 @@ ETF_SECTORS: dict[str, str] = {
     "TIP":  "Fixed Income",
     "GLD":  "Real Assets",
     "VNQ":  "Real Estate",
-    "DJP":  "Real Assets",
     "XLK":  "Information Technology",
     "XLF":  "Financials",
     "XLV":  "Health Care",
