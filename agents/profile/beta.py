@@ -1,21 +1,14 @@
 """
-beta.py — DEPRECATED
-=====================
-This module has been replaced by hc_beta_table.py.
+beta.py — DEPRECATED.
 
-The OLS regression here regressed synthetic Gaussian noise (sigma * N(0,1))
-against Fama-French sector returns, producing beta ≈ 0 for every client
-regardless of career type. The regression was not estimating income sensitivity
-to markets — it was fitting noise.
+The original OLS approach regressed synthetic Gaussian noise (σ × N(0,1))
+against Fama-French sector returns and produced β ≈ 0 for every client
+regardless of career type. It has been replaced by the calibrated β/ρ table.
 
-Replacement:
-    from .hc_beta_table import lookup_hc_beta
-    beta, correlation = lookup_hc_beta(hc_type)
-
-The calibrated table uses values from Ibbotson, Milevsky, Chen, Zhu (2007)
-and Davis & Willen (2000). See hc_beta_table.py for full citations.
+Use agents.profile.hc_beta_table.lookup_hc_beta() instead.
 """
 
 raise ImportError(
-    "beta.py is deprecated. Use hc_beta_table.lookup_hc_beta() instead."
+    "agents.profile.beta is deprecated. Import lookup_hc_beta from "
+    "agents.profile.hc_beta_table instead."
 )

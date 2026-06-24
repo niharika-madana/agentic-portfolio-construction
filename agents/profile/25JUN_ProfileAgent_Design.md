@@ -1,7 +1,7 @@
 # Profile Agent — Design Document
 **AI Financial Advisor Pipeline | Agent 1 of 5**
 *Fordham MSQF Capstone 2026*
-*Last updated: 2026-06-23 (June 23 session — BLS OES redesign: replaced hardcoded personas + noise OLS with data-driven pipeline)*
+*Last updated: 2026-06-25 (June 25 session — added industry bonus factor from BLS ECEC Q1 2026; HC formula updated to use effective_salary = base × (1 + bonus_rate))*
 
 ---
 
@@ -18,17 +18,21 @@ The agent is fully data-driven. Every numeric field traces to a primary source (
 ```
 FRED DGS10              → discount_rate (live 10Y Treasury yield)
 BLS OES May 2023        → salary percentiles by SOC code
+                           cached as data/storage/bls_oes_2023.parquet
+BLS ECEC Q1 2026        → bonus_rate by SOC code (BONUS_RATE_TABLE)
 SCF 2022 (static table) → financial_capital by age × income quartile
                                ↓
         build_bls_personas()  → raw persona dicts
+          effective_salary = annual_salary × (1 + bonus_rate)
                                ↓
         For each persona:
           hc_type = HUMAN_CAPITAL_TYPE[income_stability]
-          β, ρ    = lookup_hc_beta(hc_type)       ← calibrated table
-          profile = build_profile(persona, r, β, ρ) ← single call
-          output  = to_profile_agent_output(profile) ← Pydantic validation
+          β, ρ    = lookup_hc_beta(hc_type)             ← calibrated table
+          profile = build_profile(persona)               ← single call
+          output  = to_profile_agent_output(profile)     ← Pydantic validation
                                ↓
         list[ProfileAgentOutput]  →  orchestrator.run_pipeline()
+        also saved as data/storage/profiles_all.parquet
 ```
 
 Single-pass architecture. Beta is known before `build_profile()` is called — there is no two-pass design.
@@ -55,14 +59,18 @@ agents/profile/
 
 ### Human Capital Valuation
 
-Present value of future salary stream, discounted at the 10Y Treasury yield:
+Present value of the full expected earnings stream (base + bonus), discounted at the 10Y Treasury yield:
 
 ```
-HC = Annual Salary × [1 − (1 + r)^(−n)] / r
+Effective Annual Earnings = Annual Salary × (1 + bonus_rate)
+HC = Effective Annual Earnings × [1 − (1 + r)^(−n)] / r
 ```
 
+- `bonus_rate` = industry-specific bonus rate from BLS ECEC Q1 2026 (see `BONUS_RATE_TABLE`)
 - `r` = FRED DGS10 (live). Fallback: 4.4% if API call fails.
 - `n` = years to retirement (= 65 − age)
+
+Ignoring bonuses would systematically understate HC for every occupation — particularly management and financial roles where supplemental pay is a meaningful share of total compensation.
 
 > **Source:** Board of Governors of the Federal Reserve System (US), Market Yield on U.S. Treasury Securities at 10-Year Constant Maturity [DGS10], FRED, Federal Reserve Bank of St. Louis. https://fred.stlouisfed.org/series/DGS10
 
@@ -131,7 +139,7 @@ Live 10Y Treasury yield pulled via FRED API at runtime. Falls back to 4.4% on fa
 
 **Bureau of Labor Statistics, Occupational Employment and Wage Statistics, May 2023 National Estimates.**
 
-Downloaded as a zip file from BLS and cached locally (`bls_oes_2023_national.xlsx`). Columns used:
+Downloaded as a flat file from BLS (`national_M2023_dl.xlsx`) and cached locally as `data/storage/bls_oes_2023.parquet` on first run. Subsequent runs load from parquet. Columns used:
 
 | Column | Description |
 |---|---|
@@ -142,7 +150,31 @@ Downloaded as a zip file from BLS and cached locally (`bls_oes_2023_national.xls
 
 Values of `#` (suppressed) or `*` (not available) are treated as NaN and those variants are skipped.
 
-> Source: U.S. Bureau of Labor Statistics. Occupational Employment and Wage Statistics. https://www.bls.gov/oes/current/oes_nat.htm
+> Source: U.S. Bureau of Labor Statistics. Occupational Employment and Wage Statistics, May 2023. https://www.bls.gov/oes/2023/may/oes_nat.htm
+
+### BLS ECEC — Bonus Rates
+
+**Bureau of Labor Statistics, Employer Costs for Employee Compensation (ECEC), Q1 2026, Table 5.**
+
+Bonus rates are derived from supplemental pay as a percentage of total compensation by occupational group (full-time private industry workers), converted to a fraction of base salary:
+
+```
+bonus_rate = supplemental_pay_pct / wages_and_salaries_pct
+```
+
+| SOC | Occupation | BLS Occupational Group | Supp. Pay % of TC | Wages % of TC | bonus_rate |
+|---|---|---|---|---|---|
+| 25-1042 | Biology Professor | Education & health services (nonunion) | 3.3% | 71.9% | 0.046 |
+| 29-1141 | Registered Nurse | Education & health services (nonunion) | 3.3% | 71.9% | 0.046 |
+| 13-1041 | Compliance Officer | Professional and related | 4.1% | 68.0% | 0.060 |
+| 23-1011 | Lawyer | Professional and related | 4.1% | 68.0% | 0.060 |
+| 17-2141 | Mechanical Engineer | Professional and related | 4.1% | 68.0% | 0.060 |
+| 13-2051 | Financial Analyst | Management, business & financial | 5.7% | 67.3% | 0.085 |
+| 15-1252 | Software Developer | Management, business & financial | 5.7% | 67.3% | 0.085 |
+| 11-3021 | IT Manager | Management, business & financial | 5.7% | 67.3% | 0.085 |
+| 11-2022 | Sales Manager | Sales and related | 3.6% | 72.5% | 0.050 |
+
+> Source: U.S. Bureau of Labor Statistics, Employer Costs for Employee Compensation, Q1 2026. Table 5: Private industry workers by bargaining and work status — full-time workers by occupational group. Last modified June 12, 2026. https://www.bls.gov/news.release/ecec.t05.htm
 
 ### SCF 2022 — Financial Capital
 
@@ -289,24 +321,26 @@ Higher salary percentile → larger equity grant as a fraction of total compensa
 | | Biology Professor | Financial Analyst | Software Developer |
 |---|---|---|---|
 | **SOC** | 25-1042 | 13-2051 | 15-1252 |
-| **BLS Median Salary** | ~$81,840 | ~$99,890 | ~$130,160 |
+| **BLS Median Salary** | ~$83,920 | ~$99,010 | ~$132,270 |
+| **Bonus Rate (BLS ECEC)** | 4.6% | 8.5% | 8.5% |
+| **Effective Annual Earnings** | ~$87,782 | ~$107,426 | ~$143,513 |
 | **Age** | 47 | 40 | 38 |
 | **Financial Capital (SCF)** | $200,000 | $90,000 | $90,000 |
-| **Human Capital** | ~$1,000,000 | ~$1,488,000 | ~$2,037,000 |
-| **Total Wealth** | ~$1,200,000 | ~$1,578,000 | ~$2,127,000 |
-| **HC Share** | 0.833 | 0.943 | 0.958 |
+| **Human Capital** | ~$1,046,000 | ~$1,601,000 | ~$2,246,000 |
+| **Total Wealth** | ~$1,246,000 | ~$1,691,000 | ~$2,336,000 |
+| **HC Share** | 0.839 | 0.947 | 0.961 |
 | **σ** | 0.05 | 0.20 | 0.40 |
 | **HC Type** | bond-like | mixed | equity-like |
 | **β** | 0.05 | 0.35 | 0.90 |
 | **ρ** | 0.10 | 0.40 | 0.75 |
-| **Implicit Equity Exposure** | **0.042** | **0.330** | **0.862** |
-| **Effective Risk Budget** | 0.958 | 0.811 | 0.617 |
-| **Portfolio Equity Target** | **+0.916** | **+0.481** | **−0.245** |
+| **Implicit Equity Exposure** | **0.042** | **0.332** | **0.865** |
+| **Effective Risk Budget** | 0.958 | 0.811 | 0.616 |
+| **Portfolio Equity Target** | **+0.916** | **+0.479** | **−0.249** |
 | **Risk Tolerance** | moderate | moderate | aggressive |
 
-**Key insight:** The software developer's portfolio equity target is negative. Their career already provides 86.2% equity exposure through RSU vesting, layoff correlation, and bonus sensitivity to tech market conditions. Their effective risk budget is only 61.7%. Even before looking at their portfolio, they are over-exposed to equity. The Allocation Agent should underweight equities relative to what risk tolerance alone would suggest and use bonds and alternatives to hedge the career risk.
+**Key insight:** The software developer's portfolio equity target is negative. Their career already provides 86.5% equity exposure through RSU vesting, layoff correlation, and bonus sensitivity to tech market conditions. Their effective risk budget is only 61.6%. Even before looking at their portfolio, they are over-exposed to equity. The Allocation Agent should underweight equities relative to what risk tolerance alone would suggest and use bonds and alternatives to hedge the career risk.
 
-The biology professor's bond-like income — a stable, government-indifferent salary — contributes almost no equity exposure (4.2%). They can hold 91.6% equity in their portfolio without exceeding their risk budget.
+The biology professor's bond-like income — a stable, government-indifferent salary — contributes almost no equity exposure (4.2%). They can hold 91.6% equity in their portfolio without exceeding their risk budget. Note that including the 4.6% bonus rate increases their HC by ~$46,000 relative to a base-salary-only calculation.
 
 ---
 
@@ -335,11 +369,13 @@ Example output for Biology Professor (p50):
   "income_equity_correlation": 0.10,
   "implicit_equity_exposure": 0.042,
   "human_capital_type": "bond-like",
-  "income_stability": "high",
+  "income_stability": "High",
   "effective_risk_budget": 0.958,
+  "portfolio_equity_target": 0.916,
   "industry_exposure_sector": "Education",
   "RSU_concentration": 0.0,
   "has_pension": true,
+  "bonus_rate": 0.046,
   "current_holdings": {
     "US_equity": 0.50,
     "intl_equity": 0.15,
@@ -369,12 +405,14 @@ Example output for Biology Professor (p50):
 - `income_equity_correlation` → HC-correlation adjusted sector limits: `adjusted_limit = base_limit × (1 − ρ)`
 - `RSU_concentration` → single-stock concentration risk flag
 - `liquidity_needs` → minimum cash floor in stress scenarios
+- `has_pension` → supplementary income floor in retirement stress scenarios
 
 **Compliance Agent:**
 - `human_capital_type` → classifies income stream, drives portfolio constraint framing
 - `industry_exposure_sector` → sector concentration check against regulatory limits
 - `risk_tolerance_level`, `investment_horizon_years`, `age` → FINRA Rule 2111 suitability
 - `RSU_concentration` → ICA §5b1 concentration breach trigger
+- `bonus_rate` → included in total compensation audit trail
 
 ---
 
@@ -408,8 +446,9 @@ FRED is unreachable or the API key is invalid.
 ## Implementation Notes
 
 - **Entry point:** `agents/profile/profile_agent.py` → `run_profile_agent()`
-- **BLS cache:** `bls_oes_2023_national.xlsx` in working directory. Downloaded once, reused on subsequent runs.
-- **Output:** `agents/profile/profiles_all.json`
+- **BLS OES source file:** `national_M2023_dl.xlsx` — converted and cached as `data/storage/bls_oes_2023.parquet` on first run
+- **Output (JSON):** `agents/profile/profiles_all.json`
+- **Output (Parquet):** `data/storage/profiles_all.parquet` — consumed by Allocation, Risk, Compliance agents
 - **Runtime environment:** Google Colab or local Python 3.11+
 - **API keys needed:** `FRED_API` only. No Anthropic or OpenAI keys required.
 - **Dependencies:** `requests`, `pandas`, `openpyxl`, `numpy`, `pydantic`

@@ -1,320 +1,185 @@
 """
-personas.py — Profile Agent
-============================
-BLS OES-based persona construction.
+personas.py — BLS-grounded persona construction.
 
-Replaces:
-  - RAW_PERSONAS (hardcoded salary/wealth dicts)
-  - generate_synthetic() (Claude + GPT-4o pipeline)
+TARGET_OCCUPATIONS defines the nine-occupation default universe. build_bls_personas()
+joins BLS OES salary percentiles with SCF financial capital and the documented
+qualitative-field derivation rules to produce raw persona dicts, one (or three,
+with percentile variants) per occupation.
 
-All salary data comes from BLS OES May 2023.
-All financial_capital data comes from SCF 2022 (via loaders.SCF_FINANCIAL_ASSETS).
-Qualitative fields (risk_tolerance, liquidity_needs, investment_objective,
-current_holdings) are derived from occupation characteristics via documented rules.
-
-Exports:
-  - TARGET_OCCUPATIONS
-  - SOC_TO_GICS
-  - HUMAN_CAPITAL_TYPE
-  - build_bls_personas()
+Every qualitative field is derived from a documented rule (see the design doc's
+"Qualitative Field Derivation Rules" section) — none are invented.
 """
+
+from __future__ import annotations
 
 import pandas as pd
 
-from .human_capital import HUMAN_CAPITAL_TYPE
-from .loaders import get_scf_financial_capital
+from agents.profile.hc_beta_table import hc_type_for_stability
+from agents.profile.loaders import (
+    BONUS_RATE_TABLE,
+    get_age_bracket,
+    lookup_financial_capital,
+)
 
-# ---------------------------------------------------------------------------
-# Target occupations — 9 covering all three HC types
-# age: approximate median from BLS CPS Table 11 "Median age by occupation"
-# ---------------------------------------------------------------------------
-
+# ── Target occupations (9 SOC codes) — BLS OES May 2023 ────────────────────
+# https://www.bls.gov/oes/2023/may/oes_nat.htm
 TARGET_OCCUPATIONS = [
-    # ── Bond-like (σ=0.05, β=0.05, ρ=0.10) ─────────────────────────────
-    {
-        "soc":              "25-1042",
-        "label":            "Biology Professor",
-        "career_type":      "Academia",
-        "income_stability": "High",
-        "age":              47,
-        "has_pension":      True,
-        "rsu_eligible":     False,
-    },
-    {
-        "soc":              "29-1141",
-        "label":            "Registered Nurse",
-        "career_type":      "Healthcare",
-        "income_stability": "High",
-        "age":              43,
-        "has_pension":      False,
-        "rsu_eligible":     False,
-    },
-    {
-        "soc":              "13-1041",
-        "label":            "Compliance Officer",
-        "career_type":      "Government",
-        "income_stability": "High",
-        "age":              44,
-        "has_pension":      True,
-        "rsu_eligible":     False,
-    },
-    # ── Mixed (σ=0.20, β=0.35, ρ=0.40) ─────────────────────────────────
-    {
-        "soc":              "23-1011",
-        "label":            "Lawyer",
-        "career_type":      "Legal",
-        "income_stability": "Medium",
-        "age":              46,
-        "has_pension":      False,
-        "rsu_eligible":     False,
-    },
-    {
-        "soc":              "17-2141",
-        "label":            "Mechanical Engineer",
-        "career_type":      "Engineering",
-        "income_stability": "Medium",
-        "age":              44,
-        "has_pension":      False,
-        "rsu_eligible":     False,
-    },
-    {
-        "soc":              "13-2051",
-        "label":            "Financial Analyst",
-        "career_type":      "Finance",
-        "income_stability": "Medium",
-        "age":              40,
-        "has_pension":      False,
-        "rsu_eligible":     False,
-    },
-    # ── Equity-like (σ=0.40, β=0.90, ρ=0.75) ───────────────────────────
-    {
-        "soc":              "15-1252",
-        "label":            "Software Developer",
-        "career_type":      "Technology",
-        "income_stability": "Low",
-        "age":              38,
-        "has_pension":      False,
-        "rsu_eligible":     True,
-    },
-    {
-        "soc":              "11-3021",
-        "label":            "IT Manager",
-        "career_type":      "Technology",
-        "income_stability": "Low",
-        "age":              45,
-        "has_pension":      False,
-        "rsu_eligible":     True,
-    },
-    {
-        "soc":              "11-2022",
-        "label":            "Sales Manager",
-        "career_type":      "Sales",
-        "income_stability": "Low",
-        "age":              42,
-        "has_pension":      False,
-        "rsu_eligible":     False,
-    },
+    {"soc": "25-1042", "label": "Biology Professor",   "career_type": "Academia",    "income_stability": "High",   "has_pension": True,  "rsu_eligible": False, "sector": "Education"},
+    {"soc": "29-1141", "label": "Registered Nurse",    "career_type": "Healthcare",  "income_stability": "High",   "has_pension": False, "rsu_eligible": False, "sector": "Healthcare"},
+    {"soc": "13-1041", "label": "Compliance Officer",  "career_type": "Government",  "income_stability": "High",   "has_pension": True,  "rsu_eligible": False, "sector": "Government"},
+    {"soc": "23-1011", "label": "Lawyer",              "career_type": "Legal",       "income_stability": "Medium", "has_pension": False, "rsu_eligible": False, "sector": "Legal"},
+    {"soc": "17-2141", "label": "Mechanical Engineer", "career_type": "Engineering", "income_stability": "Medium", "has_pension": False, "rsu_eligible": False, "sector": "Industrials"},
+    {"soc": "13-2051", "label": "Financial Analyst",   "career_type": "Finance",     "income_stability": "Medium", "has_pension": False, "rsu_eligible": False, "sector": "Financial Services"},
+    {"soc": "15-1252", "label": "Software Developer",  "career_type": "Technology",  "income_stability": "Low",    "has_pension": False, "rsu_eligible": True,  "sector": "Technology"},
+    {"soc": "11-3021", "label": "IT Manager",          "career_type": "Technology",  "income_stability": "Low",    "has_pension": False, "rsu_eligible": True,  "sector": "Technology"},
+    {"soc": "11-2022", "label": "Sales Manager",       "career_type": "Sales",       "income_stability": "Low",    "has_pension": False, "rsu_eligible": False, "sector": "Consumer Discretionary"},
 ]
 
-# ---------------------------------------------------------------------------
-# SOC code → GICS-aligned sector string
-# ---------------------------------------------------------------------------
-
-SOC_TO_GICS: dict[str, str] = {
-    "25-1042": "Education",
-    "29-1141": "Health Care",
-    "13-1041": "Government / Public Administration",
-    "23-1011": "Professional Services",
-    "17-2141": "Industrials",
-    "13-2051": "Financials",
-    "15-1252": "Information Technology",
-    "11-3021": "Information Technology",
-    "11-2022": "Consumer Discretionary",
+# ── Representative career-midpoint age per SOC ─────────────────────────────
+# Used for the HC annuity horizon n = 65 − age and the SCF lookup.
+SOC_AGES = {
+    "25-1042": 47,   # Biology Professor
+    "29-1141": 38,   # Registered Nurse
+    "13-1041": 42,   # Compliance Officer
+    "23-1011": 45,   # Lawyer
+    "17-2141": 41,   # Mechanical Engineer
+    "13-2051": 40,   # Financial Analyst
+    "15-1252": 38,   # Software Developer
+    "11-3021": 44,   # IT Manager
+    "11-2022": 44,   # Sales Manager
 }
 
+# ── RSU concentration by BLS percentile (RSU-eligible SOCs only) ──────────
+RSU_BY_PERCENTILE = {
+    "p25": 0.20,
+    "p50": 0.35,
+    "p75": 0.55,
+}
+
+# BLS percentile → OES wage column.
+_PCT_COL_MAP = {"p25": "A_PCT25", "p50": "A_MEDIAN", "p75": "A_PCT75"}
+
 
 # ---------------------------------------------------------------------------
-# Rule-based field derivation
+# Qualitative-field derivation rules
 # ---------------------------------------------------------------------------
 
-def _derive_risk_tolerance(hc_type: str, age: int) -> str:
-    """
-    Rule: stable income (bond-like HC) offsets portfolio risk budget, allowing
-    slightly higher portfolio equity; but older clients near retirement cap this.
-
-    bond-like + age < 50  → moderate (stable base lets them take portfolio risk)
-    bond-like + age >= 50 → conservative (approaching retirement, protect gains)
-    mixed                  → moderate
-    equity-like + age < 45 → aggressive (high income upside, long horizon)
-    equity-like + age >= 45 → moderate (income risk already high, balance it)
-    """
+def derive_risk_tolerance(hc_type: str, age: int) -> str:
+    """Risk tolerance from HC type and age (design doc table)."""
     if hc_type == "bond-like":
-        return "Conservative" if age >= 50 else "Moderate"
+        return "conservative" if age >= 50 else "moderate"
     if hc_type == "mixed":
-        return "Moderate"
+        return "moderate"
     # equity-like
-    return "Aggressive" if age < 45 else "Moderate"
+    return "aggressive" if age < 45 else "moderate"
 
 
-def _derive_liquidity_needs(income_stability: str) -> str:
-    """
-    Rule: income predictability drives liquidity need.
-
-    High stability (regular salary) → Low liquidity need; income itself is the buffer.
-    Medium stability (bonus-driven)  → Medium; bonus timing is unpredictable.
-    Low stability (RSU/commission)   → Medium; equity vesting and variable cash flow.
-    """
-    return {"High": "Low", "Medium": "Medium", "Low": "Medium"}[income_stability]
+def derive_liquidity_needs(income_stability: str) -> str:
+    """Stable salary → low; variable income → medium."""
+    return "low" if income_stability == "High" else "medium"
 
 
-def _derive_investment_objective(years_to_retirement: int) -> str:
-    """
-    Rule based on investment horizon:
-    > 20 years  → Growth (maximize long-run accumulation)
-    10–20 years → Growth (still accumulating, can absorb volatility)
-    < 10 years  → Income (shift toward capital preservation)
-    """
-    if years_to_retirement >= 10:
-        return "Growth"
-    return "Income"
+def derive_investment_objective(age: int) -> str:
+    """≥10 years to retirement → growth, else income."""
+    return "growth" if (65 - age) >= 10 else "income"
 
 
-def _derive_rsu_concentration(occ: dict, percentile_label: str) -> float:
-    """
-    RSU concentration only applies to equity-like, RSU-eligible occupations.
-    Higher salary percentile → more of compensation is in equity.
-
-    p25: 20% RSU (below-median compensation, less equity grant)
-    p50: 35% RSU (typical mid-career equity grant)
-    p75: 55% RSU (senior IC or manager level, heavy equity comp)
-    """
-    if not occ["rsu_eligible"]:
-        return 0.0
-    return {"p25": 0.20, "p50": 0.35, "p75": 0.55}[percentile_label]
-
-
-def _derive_current_holdings(
-    age: int,
-    risk_tolerance: str,
-    rsu_concentration: float,
+def derive_current_holdings(
+    hc_type: str, age: int, risk_tolerance: str, rsu_concentration: float
 ) -> dict[str, float]:
     """
-    Rule-based asset allocation from SCF 2022 Table 7 "Family Holdings of
-    Financial Assets by Selected Characteristics."
+    Derive a current-holdings dict that sums to exactly 1.0.
 
-    For RSU holders, employer_RSU takes the RSU concentration weight and
-    remaining capital is split across broad market assets.
-
-    All weights sum to exactly 1.0.
+    RSU holders: employer_RSU + a 55/25/20 split of the remainder across
+    US_equity / bonds / cash. Non-RSU holders: SCF Table 7 holdings by risk
+    tolerance and age.
     """
-    rt = risk_tolerance.lower()
-
     if rsu_concentration > 0:
-        remaining = round(1.0 - rsu_concentration, 2)
         return {
-            "employer_RSU": rsu_concentration,
-            "US_equity":    round(remaining * 0.55, 2),
-            "bonds":        round(remaining * 0.25, 2),
-            "cash":         round(remaining * 0.20, 2),
+            "employer_RSU": round(rsu_concentration, 2),
+            "US_equity":    round((1 - rsu_concentration) * 0.55, 2),
+            "bonds":        round((1 - rsu_concentration) * 0.25, 2),
+            "cash":         round((1 - rsu_concentration) * 0.20, 2),
         }
-
-    if rt == "aggressive":
-        if age < 45:
-            return {"US_equity": 0.65, "intl_equity": 0.20, "bonds": 0.10, "cash": 0.05}
-        return {"US_equity": 0.55, "intl_equity": 0.20, "bonds": 0.20, "cash": 0.05}
-
-    if rt == "moderate":
-        if age < 45:
-            return {"US_equity": 0.50, "intl_equity": 0.15, "bonds": 0.25, "cash": 0.10}
-        return {"US_equity": 0.40, "intl_equity": 0.15, "bonds": 0.35, "cash": 0.10}
-
-    # conservative
-    return {"US_equity": 0.25, "intl_equity": 0.10, "bonds": 0.50, "cash": 0.15}
+    table = {
+        ("aggressive", "young"):   {"US_equity": 0.65, "intl_equity": 0.20, "bonds": 0.10, "cash": 0.05},
+        ("aggressive", "older"):   {"US_equity": 0.55, "intl_equity": 0.20, "bonds": 0.20, "cash": 0.05},
+        ("moderate",   "young"):   {"US_equity": 0.50, "intl_equity": 0.15, "bonds": 0.25, "cash": 0.10},
+        ("moderate",   "older"):   {"US_equity": 0.40, "intl_equity": 0.15, "bonds": 0.35, "cash": 0.10},
+        ("conservative", "any"):   {"US_equity": 0.25, "intl_equity": 0.10, "bonds": 0.50, "cash": 0.15},
+    }
+    age_key = "older" if age >= 45 else "young"
+    key = (risk_tolerance, "any") if risk_tolerance == "conservative" else (risk_tolerance, age_key)
+    return dict(table[key])
 
 
 # ---------------------------------------------------------------------------
-# Main builder
+# Persona builder
 # ---------------------------------------------------------------------------
 
 def build_bls_personas(
-    bls_data: pd.DataFrame,
-    include_percentile_variants: bool = False,
+    oes_df: pd.DataFrame, include_percentile_variants: bool = False
 ) -> list[dict]:
     """
-    Build persona dicts from BLS OES salary data and SCF wealth data.
+    Build raw persona dicts from BLS OES + SCF + derivation rules.
 
-    For each occupation in TARGET_OCCUPATIONS, creates:
-        - 1 persona (median / p50) if include_percentile_variants=False
-        - 3 personas (p25, p50, p75) if include_percentile_variants=True
+    Default: one persona per occupation at the median (p50) salary.
+    include_percentile_variants=True: three per occupation (p25, p50, p75),
+    up to 27 personas.
 
-    All qualitative fields (risk_tolerance, liquidity_needs, investment_objective,
-    current_holdings) are derived via documented rules, not hardcoded.
-
-    Returns:
-        list[dict] — raw persona dicts ready for build_profile()
+    Missing SOC codes and suppressed wage cells are skipped with a warning —
+    the pipeline never crashes on a single bad row.
     """
-    personas = []
+    percentiles = ["p25", "p50", "p75"] if include_percentile_variants else ["p50"]
 
+    personas: list[dict] = []
     for occ in TARGET_OCCUPATIONS:
         soc = occ["soc"]
-
-        if soc not in bls_data.index:
-            print(f"WARNING: SOC {soc} ({occ['label']}) not found in BLS data — skipping")
+        row = oes_df[oes_df["OCC_CODE"] == soc]
+        if row.empty:
+            print(f"WARNING: SOC {soc} ({occ['label']}) not found in OES data — skipping")
             continue
 
-        row = bls_data.loc[soc]
+        age = SOC_AGES[soc]
+        hc_type = hc_type_for_stability(occ["income_stability"])
+        bonus_rate = BONUS_RATE_TABLE[soc]
+        _ = get_age_bracket(age)  # validates the age maps to a known bracket
 
-        # Decide which salary percentiles to generate
-        if include_percentile_variants:
-            candidates = [
-                ("p25", row.get("A_PCT25")),
-                ("p50", row.get("A_MEDIAN")),
-                ("p75", row.get("A_PCT75")),
-            ]
-        else:
-            candidates = [("p50", row.get("A_MEDIAN"))]
-
-        for pct_label, salary in candidates:
+        for pct in percentiles:
+            salary = row[_PCT_COL_MAP[pct]].values[0]
             if pd.isna(salary):
-                print(f"  SKIP: {soc} {pct_label} — BLS wage suppressed or unavailable")
+                print(f"WARNING: {soc} {occ['label']} {pct} wage suppressed — skipping")
                 continue
 
-            salary             = int(salary)
-            age                = occ["age"]
-            years_to_ret       = 65 - age
-            hc_type            = HUMAN_CAPITAL_TYPE[occ["income_stability"]]
-            risk_tolerance     = _derive_risk_tolerance(hc_type, age)
-            liquidity_needs    = _derive_liquidity_needs(occ["income_stability"])
-            investment_obj     = _derive_investment_objective(years_to_ret)
-            rsu_concentration  = _derive_rsu_concentration(occ, pct_label)
-            current_holdings   = _derive_current_holdings(age, risk_tolerance, rsu_concentration)
-            financial_capital  = get_scf_financial_capital(age, pct_label)
+            salary = float(salary)
+            effective_salary = round(salary * (1 + bonus_rate), 2)
+            financial_capital = lookup_financial_capital(age, pct)
+            rsu_concentration = RSU_BY_PERCENTILE[pct] if occ["rsu_eligible"] else 0.0
+            risk_tolerance = derive_risk_tolerance(hc_type, age)
 
-            persona = {
-                "client_id":                f"bls_{soc}_{pct_label}",
-                "name":                     f"{occ['label']} ({pct_label.upper()})",
+            personas.append({
+                "client_id":                f"bls_{soc}_{pct}",
+                "soc":                      soc,
+                "label":                    occ["label"],
+                "career_type":              occ["career_type"],
                 "age":                      age,
                 "annual_salary":            salary,
-                "years_to_retirement":      years_to_ret,
-                "career_type":              occ["career_type"],
-                "income_stability":         occ["income_stability"],   # "High"/"Medium"/"Low"
-                "industry_exposure_sector": SOC_TO_GICS[soc],
-                "financial_capital":        financial_capital,
-                "current_holdings":         current_holdings,
-                "investment_horizon_years": years_to_ret,
-                "risk_tolerance":           risk_tolerance,            # "Conservative" etc.
-                "liquidity_needs":          liquidity_needs,           # "Low" etc.
-                "investment_objective":     investment_obj,            # "Growth" etc.
+                "bonus_rate":               bonus_rate,
+                "effective_salary":         effective_salary,
+                "years_to_retirement":      65 - age,
+                "income_stability":         occ["income_stability"],
+                "industry_exposure_sector": occ["sector"],
+                "financial_capital":        float(financial_capital),
+                "current_holdings":         derive_current_holdings(
+                    hc_type, age, risk_tolerance, rsu_concentration
+                ),
+                "investment_horizon_years": 65 - age,
+                "risk_tolerance":           risk_tolerance,
+                "liquidity_needs":          derive_liquidity_needs(occ["income_stability"]),
+                "investment_objective":     derive_investment_objective(age),
                 "RSU_concentration":        rsu_concentration,
                 "has_pension":              occ["has_pension"],
-            }
-            personas.append(persona)
-            print(
-                f"  {persona['client_id']:30s}  "
-                f"salary=${salary:>9,}  "
-                f"FC=${financial_capital:>9,}  "
-                f"hc_type={hc_type}"
-            )
+            })
 
-    print(f"\nbuild_bls_personas: {len(personas)} personas constructed")
+    print(f"Built {len(personas)} personas from {len(TARGET_OCCUPATIONS)} SOC codes")
     return personas
