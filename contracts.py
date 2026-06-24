@@ -192,11 +192,30 @@ class ProfileAgentOutput(BaseModel):
         ge=0, le=1,
         description="(FC + HC×(1−σ)) / total_wealth — risk capacity of the total balance sheet"
     )
+    portfolio_equity_target: Optional[float] = Field(
+        default=None,
+        description=(
+            "effective_risk_budget − implicit_equity_exposure. "
+            "The residual equity capacity the Allocation Agent builds around. "
+            "Negative when the career already provides more equity exposure than "
+            "the total risk budget allows. Optional for backward compatibility — "
+            "the Allocation Agent recomputes it from effective_risk_budget and "
+            "implicit_equity_exposure if not supplied."
+        )
+    )
 
     # ── Career context ────────────────────────────────────────────────
     industry_exposure_sector: str = Field(description="GICS-aligned sector of client's employer")
     RSU_concentration:        float = Field(ge=0, le=1, description="Fraction of financial holdings in employer RSUs")
     has_pension:              bool  = False
+    bonus_rate:               float = Field(
+        default=0.0, ge=0, le=1,
+        description=(
+            "Industry-specific bonus as a fraction of base salary (BLS ECEC Q1 2026). "
+            "effective_salary = annual_salary × (1 + bonus_rate) feeds the HC annuity. "
+            "Included in the Compliance Agent's total-compensation audit trail."
+        )
+    )
 
     # ── Holdings & preferences ────────────────────────────────────────
     current_holdings:         dict[str, float] = Field(description="Asset → weight; must sum to 1.0")
