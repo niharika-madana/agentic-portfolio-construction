@@ -12,7 +12,7 @@ from portfolio_system.core.risk import (
     _EMPLOYER_HC_SHOCK,
 )
 from portfolio_system.schemas import (
-    RiskProfile, RiskDecision, StressSeverity,
+    MarketRegime, RiskProfile, RiskDecision, StressSeverity,
     ConcentrationFlags, HumanCapitalAdjustedMetrics,
     StressResult, AllocationConstraint, ConstraintType,
 )
@@ -96,24 +96,29 @@ class TestMaxDrawdown:
 # ── _severity ─────────────────────────────────────────────────────────────────
 
 class TestSeverity:
-    # Moderate cap = 0.20
+    # _severity(loss, cap) — cap is now passed as a float directly
     def test_low_below_half_cap(self):
-        assert _severity(0.05, RiskProfile.MODERATE) == StressSeverity.LOW
+        assert _severity(0.05, 0.20) == StressSeverity.LOW
 
     def test_medium_between_half_and_cap(self):
-        assert _severity(0.15, RiskProfile.MODERATE) == StressSeverity.MEDIUM
+        assert _severity(0.15, 0.20) == StressSeverity.MEDIUM
 
     def test_high_between_cap_and_1_5x(self):
-        assert _severity(0.25, RiskProfile.MODERATE) == StressSeverity.HIGH
+        assert _severity(0.25, 0.20) == StressSeverity.HIGH
 
     def test_critical_above_1_5x_cap(self):
-        assert _severity(0.35, RiskProfile.MODERATE) == StressSeverity.CRITICAL
+        assert _severity(0.35, 0.20) == StressSeverity.CRITICAL
 
     def test_conservative_cap_is_lower(self):
         # 0.12 is MEDIUM for conservative (cap=0.15, half=0.075)
-        assert _severity(0.12, RiskProfile.CONSERVATIVE) == StressSeverity.MEDIUM
+        assert _severity(0.12, 0.15) == StressSeverity.MEDIUM
         # Same loss is LOW for aggressive (cap=0.25, half=0.125)
-        assert _severity(0.12, RiskProfile.AGGRESSIVE)   == StressSeverity.LOW
+        assert _severity(0.12, 0.25) == StressSeverity.LOW
+
+    def test_crisis_regime_widens_cap(self):
+        # During crisis the effective cap for moderate is 0.30 (1.5×0.20)
+        # A 25% loss that would be HIGH at normal cap is MEDIUM at crisis cap
+        assert _severity(0.25, 0.30) == StressSeverity.MEDIUM
 
 
 # ── make_decision ─────────────────────────────────────────────────────────────
@@ -135,6 +140,8 @@ class TestMakeDecision:
                 employer_concentration=0.10,
             ),
             risk_profile=RiskProfile.MODERATE,
+            effective_risk_profile=RiskProfile.MODERATE,
+            regime=MarketRegime.NORMAL,
             flag_iteration=0,
             tickers=self.TICKERS,
             weights=self.WEIGHTS,
@@ -162,9 +169,19 @@ class TestMakeDecision:
         assert decision == RiskDecision.FLAG
         assert len(constr) > 0
 
-    def test_reject_iteration_exhausted(self):
-        decision, _ = self._decide(flag_iteration=3)
+    def test_reject_iteration_exhausted_with_violations(self):
+        # Iteration limit reached AND violations remain → REJECT
+        viols = [AllocationConstraint(
+            constraint_type=ConstraintType.SINGLE_NAME,
+            target="A", current_value=0.12, limit=0.10,
+        )]
+        decision, _ = self._decide(flag_iteration=2, violations=viols)
         assert decision == RiskDecision.REJECT
+
+    def test_approve_iteration_exhausted_no_violations(self):
+        # Iteration limit reached but portfolio converged — no violations → APPROVE
+        decision, _ = self._decide(flag_iteration=2)
+        assert decision == RiskDecision.APPROVE
 
     def test_reject_hc_fraction_above_employer_limit(self):
         # hc_fraction > EMPLOYER_LIMIT (0.15) → structurally unfixable
@@ -177,12 +194,50 @@ class TestMakeDecision:
         decision, _ = self._decide(hc_adjusted=bad_hc)
         assert decision == RiskDecision.REJECT
 
-    def test_reject_critical_stress_no_violations(self):
+    def test_flag_critical_stress_generates_profile_downgrade(self):
+        from portfolio_system.schemas import ConstraintType
         critical = [StressResult(
             scenario="Crash", portfolio_loss=0.40,
             threshold_breached=True, severity=StressSeverity.CRITICAL,
         )]
-        decision, _ = self._decide(stress_results=critical)
+        decision, constr = self._decide(stress_results=critical)
+        assert decision == RiskDecision.FLAG
+        types = [c.constraint_type for c in constr]
+        assert ConstraintType.RISK_PROFILE_DOWNGRADE in types
+
+    def test_moderate_downgrades_to_conservative(self):
+        from portfolio_system.schemas import ConstraintType
+        critical = [StressResult(
+            scenario="Crash", portfolio_loss=0.40,
+            threshold_breached=True, severity=StressSeverity.CRITICAL,
+        )]
+        _, constr = self._decide(stress_results=critical, effective_risk_profile=RiskProfile.MODERATE)
+        dc = next(c for c in constr if c.constraint_type == ConstraintType.RISK_PROFILE_DOWNGRADE)
+        assert dc.target == RiskProfile.CONSERVATIVE.value
+
+    def test_aggressive_downgrades_to_moderate(self):
+        from portfolio_system.schemas import ConstraintType
+        critical = [StressResult(
+            scenario="Crash", portfolio_loss=0.40,
+            threshold_breached=True, severity=StressSeverity.CRITICAL,
+        )]
+        _, constr = self._decide(
+            stress_results=critical,
+            risk_profile=RiskProfile.AGGRESSIVE,
+            effective_risk_profile=RiskProfile.AGGRESSIVE,
+        )
+        dc = next(c for c in constr if c.constraint_type == ConstraintType.RISK_PROFILE_DOWNGRADE)
+        assert dc.target == RiskProfile.MODERATE.value
+
+    def test_reject_critical_stress_already_conservative(self):
+        critical = [StressResult(
+            scenario="Crash", portfolio_loss=0.40,
+            threshold_breached=True, severity=StressSeverity.CRITICAL,
+        )]
+        decision, _ = self._decide(
+            stress_results=critical,
+            effective_risk_profile=RiskProfile.CONSERVATIVE,
+        )
         assert decision == RiskDecision.REJECT
 
     def test_flag_takes_priority_over_critical_when_violations_exist(self):
@@ -203,6 +258,25 @@ class TestMakeDecision:
         assert decision == RiskDecision.FLAG
         flagged_tickers = {c.target for c in constr}
         assert all(t in flagged_tickers for t in self.TICKERS)
+
+    def test_crisis_regime_widens_cap(self):
+        # Moderate normal cap = 20%. Crisis cap = 30%.
+        # MDD of 25% should FLAG in NORMAL but APPROVE in CRISIS.
+        decision_normal, _ = self._decide(
+            max_drawdown=0.25, regime=MarketRegime.NORMAL,
+        )
+        decision_crisis, _ = self._decide(
+            max_drawdown=0.25, regime=MarketRegime.CRISIS,
+        )
+        assert decision_normal == RiskDecision.FLAG
+        assert decision_crisis == RiskDecision.APPROVE
+
+    def test_elevated_regime_partial_widen(self):
+        # Elevated cap = 25%. MDD of 22% should FLAG in NORMAL but APPROVE in ELEVATED.
+        decision_normal,   _ = self._decide(max_drawdown=0.22, regime=MarketRegime.NORMAL)
+        decision_elevated, _ = self._decide(max_drawdown=0.22, regime=MarketRegime.ELEVATED)
+        assert decision_normal   == RiskDecision.FLAG
+        assert decision_elevated == RiskDecision.APPROVE
 
 
 # ── compute_hc_adjusted_metrics ───────────────────────────────────────────────

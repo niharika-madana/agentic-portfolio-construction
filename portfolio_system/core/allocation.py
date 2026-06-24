@@ -7,6 +7,7 @@ from scipy.optimize import minimize, Bounds
 from portfolio_system.schemas import (
     AllocationConstraint, AllocationInput, AllocationOutput,
     ConstraintType, FactorExposures, PortfolioStatistics, WeightDecomposition,
+    RiskProfile,
 )
 from portfolio_system.core.constraints import (
     SINGLE_NAME_LIMIT, SECTOR_LIMIT,
@@ -333,9 +334,16 @@ def run_allocation(
     )
 
     # ── 6. Human capital w_fin ──
+    # Use effective risk profile: may be downgraded one step by a FLAG constraint.
+    # Reverts to user's stated profile automatically on any fresh pipeline run.
+    effective_profile = up.risk_profile
+    for fc in allocation_input.flag_constraints:
+        if fc.constraint_type == ConstraintType.RISK_PROFILE_DOWNGRADE:
+            effective_profile = RiskProfile(fc.target)
+
     port_vol    = float(np.sqrt(w_BL @ cov @ w_BL))
     port_excess = float(w_BL @ mu_BL)
-    alpha       = merton_risky_share(port_excess, port_vol, up.risk_profile)
+    alpha       = merton_risky_share(port_excess, port_vol, effective_profile)
     w_fin       = compute_w_fin(alpha, hc.present_value, up.financial_wealth, hc.income_beta)
 
     # ── 7. Decompose and build output ──

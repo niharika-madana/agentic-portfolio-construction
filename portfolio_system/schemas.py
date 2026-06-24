@@ -24,11 +24,18 @@ class StressSeverity(str, Enum):
     CRITICAL = "critical"
 
 
+class MarketRegime(str, Enum):
+    NORMAL   = "normal"    # recent vol within 1.5× long-run baseline
+    ELEVATED = "elevated"  # recent vol 1.5–2× baseline — widen caps by 25%
+    CRISIS   = "crisis"    # recent vol > 2× baseline  — widen caps by 50%
+
+
 class ConstraintType(str, Enum):
     SINGLE_NAME = "single_name"
     SECTOR = "sector"
     ECONOMIC_SECTOR = "economic_sector"
     EMPLOYER = "employer"
+    RISK_PROFILE_DOWNGRADE = "risk_profile_downgrade"
 
 
 # ── Human Capital & User Profile ──────────────────────────────────────────────
@@ -184,6 +191,8 @@ class RiskMetrics(BaseModel):
     concentration: ConcentrationFlags
     hc_adjusted: HumanCapitalAdjustedMetrics
     stress_results: list[StressResult]
+    market_regime: MarketRegime
+    effective_drawdown_cap: float = Field(..., ge=0, le=1)
 
 
 # ── Risk Agent Output / Compliance Input ──────────────────────────────────────

@@ -8,9 +8,12 @@ import anthropic
 from portfolio_system.schemas import AllocationOutput, RiskDecision, RiskOutput
 from portfolio_system.core.risk import run_risk
 
-_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-_client  = anthropic.Anthropic(api_key=_API_KEY) if _API_KEY else None
-_MODEL   = "claude-sonnet-4-6"
+_MODEL = "claude-sonnet-4-6"
+
+
+def _get_client() -> anthropic.Anthropic | None:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    return anthropic.Anthropic(api_key=key) if key else None
 
 
 def _build_prompt(alloc: AllocationOutput, risk: RiskOutput) -> str:
@@ -39,6 +42,14 @@ def _build_prompt(alloc: AllocationOutput, risk: RiskOutput) -> str:
         RiskDecision.REJECT:  "REJECT — portfolio cannot be made compliant",
     }
 
+    regime_cap_note = (
+        f"  Market regime:    {rm.market_regime.value.upper()}  "
+        f"(effective cap: {rm.effective_drawdown_cap:.1%}, "
+        f"base cap widened by {rm.effective_drawdown_cap / rm.max_drawdown * 100 - 100:.0f}%)"
+        if rm.market_regime.value != "normal" else
+        f"  Market regime:    NORMAL  (standard cap: {rm.effective_drawdown_cap:.1%})"
+    )
+
     lines = [
         "You are a risk officer writing a compliance reasoning trace for an internal audit log.",
         "",
@@ -50,6 +61,7 @@ def _build_prompt(alloc: AllocationOutput, risk: RiskOutput) -> str:
         f"  CVaR 99%:         {vc.cvar_99:.2%}  daily",
         f"  Max drawdown:     {rm.max_drawdown:.2%}",
         f"  Liquidity score:  {rm.liquidity_score:.2f}",
+        regime_cap_note,
         "",
         "HUMAN CAPITAL ADJUSTED",
         f"  Total wealth:              ${hca.total_wealth:>12,.0f}",
@@ -86,13 +98,15 @@ def run_risk_agent(
 ) -> RiskOutput:
     risk_output = run_risk(allocation_output, crsp_daily, permno_map)
 
+    _client = _get_client()
     if _client is None:
         rm = risk_output.risk_metrics
         reasoning_trace = (
             f"[No API key — template trace] "
             f"Decision: {risk_output.decision.value}. "
             f"Vol {rm.volatility:.2%}, VaR95 {rm.var_cvar.var_95:.2%}, "
-            f"max drawdown {rm.max_drawdown:.2%}. "
+            f"max drawdown {rm.max_drawdown:.2%} vs cap {rm.effective_drawdown_cap:.1%} "
+            f"(regime: {rm.market_regime.value}). "
             f"Employer concentration {rm.hc_adjusted.employer_concentration:.1%}. "
             f"Violations: {len(risk_output.constraints_violated)}."
         )

@@ -7,9 +7,12 @@ import anthropic
 from portfolio_system.schemas import AllocationInput, AllocationOutput
 from portfolio_system.core.allocation import run_allocation
 
-_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-_client  = anthropic.Anthropic(api_key=_API_KEY) if _API_KEY else None
-_MODEL   = "claude-sonnet-4-6"
+_MODEL = "claude-sonnet-4-6"
+
+
+def _get_client() -> anthropic.Anthropic | None:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    return anthropic.Anthropic(api_key=key) if key else None
 
 
 def _build_prompt(inp: AllocationInput, out: AllocationOutput) -> str:
@@ -66,6 +69,7 @@ def run_allocation_agent(
         allocation_input, crsp_monthly, ff_factors, risk_free_rate, permno_map
     )
 
+    _client = _get_client()
     if _client is None:
         top = sorted(output.weights, key=lambda w: w.total_weight, reverse=True)[:3]
         top_str = ", ".join(f"{w.ticker} {w.total_weight:.1%}" for w in top)

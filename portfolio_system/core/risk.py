@@ -5,7 +5,7 @@ import pandas as pd
 
 from portfolio_system.schemas import (
     AllocationConstraint, AllocationOutput, ConcentrationFlags,
-    ConstraintType, HumanCapitalAdjustedMetrics, RiskDecision,
+    ConstraintType, HumanCapitalAdjustedMetrics, MarketRegime, RiskDecision,
     RiskMetrics, RiskOutput, RiskProfile, StressResult, StressSeverity,
     VaRMetrics,
 )
@@ -27,6 +27,19 @@ MAX_DRAWDOWN_CAP: dict[RiskProfile, float] = {
     RiskProfile.MODERATE:     0.20,
     RiskProfile.AGGRESSIVE:   0.25,
 }
+
+# Crisis multipliers: widen the drawdown cap during high-volatility regimes so
+# the system doesn't force procyclical selling at market bottoms.
+_REGIME_CAP_MULTIPLIER: dict[MarketRegime, float] = {
+    MarketRegime.NORMAL:   1.00,  # standard cap
+    MarketRegime.ELEVATED: 1.25,  # 25% wider  — elevated but not extreme vol
+    MarketRegime.CRISIS:   1.50,  # 50% wider  — 2008/COVID-style dislocations
+}
+
+# Regime detection parameters
+_REGIME_LOOKBACK_DAYS   = 60    # recent window for vol estimation
+_ELEVATED_VOL_THRESHOLD = 1.50  # recent/long-run vol ratio → ELEVATED
+_CRISIS_VOL_THRESHOLD   = 2.00  # recent/long-run vol ratio → CRISIS
 
 # Stress scenarios anchored to observed historical losses (spec §3)
 STRESS_SCENARIOS: list[dict] = [
@@ -164,14 +177,53 @@ def compute_liquidity_score(
     log_vol = np.log1p(dollar_vol)
     max_log = log_vol.max()
     normalised = log_vol / max_log if max_log > 0 else np.zeros_like(log_vol)
-    return float(weights @ normalised)
+
+    # Normalize weights to sum to 1.0 within the risky sleeve so the score is
+    # always in [0, 1] regardless of how much cash the portfolio holds.
+    total = weights.sum()
+    w_norm = weights / total if total > 0 else weights
+    return float(w_norm @ normalised)
+
+
+# ── Regime detection ──────────────────────────────────────────────────────────
+
+def detect_regime(port_returns: np.ndarray) -> MarketRegime:
+    """
+    Classify the current market regime from portfolio return volatility.
+
+    Compares the annualized vol of the most recent _REGIME_LOOKBACK_DAYS trading
+    days to the full-sample baseline. When the ratio exceeds the thresholds the
+    regime widens the drawdown cap, preventing procyclical selling at market bottoms.
+    Reverts to NORMAL automatically as volatility normalises.
+    """
+    if len(port_returns) < _REGIME_LOOKBACK_DAYS + 30:
+        return MarketRegime.NORMAL
+
+    long_vol   = float(port_returns.std())
+    recent_vol = float(port_returns[-_REGIME_LOOKBACK_DAYS:].std())
+
+    ratio = recent_vol / long_vol if long_vol > 0 else 1.0
+
+    if ratio >= _CRISIS_VOL_THRESHOLD:
+        return MarketRegime.CRISIS
+    elif ratio >= _ELEVATED_VOL_THRESHOLD:
+        return MarketRegime.ELEVATED
+    else:
+        return MarketRegime.NORMAL
+
+
+def effective_cap(risk_profile: RiskProfile, regime: MarketRegime) -> float:
+    """
+    Regime-adjusted drawdown cap.
+    Normal → standard cap. Elevated/Crisis → widened cap, resets when vol normalises.
+    """
+    return MAX_DRAWDOWN_CAP[risk_profile] * _REGIME_CAP_MULTIPLIER[regime]
 
 
 # ── Stress testing ────────────────────────────────────────────────────────────
 
-def _severity(portfolio_loss: float, risk_profile: RiskProfile) -> StressSeverity:
-    """Assign severity relative to the investor's own drawdown cap."""
-    cap = MAX_DRAWDOWN_CAP[risk_profile]
+def _severity(portfolio_loss: float, cap: float) -> StressSeverity:
+    """Assign severity relative to the effective drawdown cap."""
     if portfolio_loss < cap * 0.5:
         return StressSeverity.LOW
     elif portfolio_loss < cap:
@@ -192,6 +244,8 @@ def _historical_portfolio_loss(
 ) -> float | None:
     """
     Cumulative portfolio loss during a stress period using actual CRSP returns.
+    weights are actual financial weights (w_BL * risky_weight), summing to risky_weight
+    not to 1.0 — the remainder is cash earning 0%, so we do NOT renormalize.
     Returns None if data is unavailable for the period.
     """
     matrix, mask = _build_daily_matrix(
@@ -199,10 +253,11 @@ def _historical_portfolio_loss(
     )
     if matrix.shape[0] == 0:
         return None
-    w_adj     = _apply_mask(weights, mask)
-    port_ret  = matrix @ w_adj
-    cum_ret   = float(np.prod(1.0 + port_ret) - 1.0)
-    return max(-cum_ret, 0.0)   # return as positive loss; 0 if portfolio gained
+    # Use actual weights for available tickers only — missing tickers contribute 0
+    w_available = weights[mask]
+    port_ret    = matrix @ w_available
+    cum_ret     = float(np.prod(1.0 + port_ret) - 1.0)
+    return max(-cum_ret, 0.0)
 
 
 def compute_stress_results(
@@ -210,7 +265,7 @@ def compute_stress_results(
     tickers: list[str],
     crsp_daily: pd.DataFrame,
     permno_map: dict[str, int],
-    risk_profile: RiskProfile,
+    drawdown_cap: float,
     employer_ticker: str,
     employer_financial_weight: float,
     hc_frac: float,
@@ -219,10 +274,13 @@ def compute_stress_results(
     Runs all stress scenarios. Historical data is used when available;
     falls back to beta-scaled benchmark loss when CRSP coverage is missing.
 
+    drawdown_cap is the regime-adjusted effective cap — severity thresholds
+    scale with it so a 25% loss in a crisis regime (cap=30%) is HIGH not CRITICAL.
+
     Also runs an idiosyncratic employer shock scenario.
     """
     results: list[StressResult] = []
-    cap = MAX_DRAWDOWN_CAP[risk_profile]
+    cap = drawdown_cap
 
     for scenario in STRESS_SCENARIOS:
         loss = _historical_portfolio_loss(
@@ -240,7 +298,7 @@ def compute_stress_results(
             scenario          = scenario["name"],
             portfolio_loss    = loss,
             threshold_breached= loss > cap,
-            severity          = _severity(loss, risk_profile),
+            severity          = _severity(loss, cap),
         ))
 
     # Idiosyncratic employer shock
@@ -254,7 +312,7 @@ def compute_stress_results(
         scenario          = "Idiosyncratic Employer Shock",
         portfolio_loss    = float(np.clip(total_employer_loss, 0.0, 1.0)),
         threshold_breached= total_employer_loss > cap,
-        severity          = _severity(total_employer_loss, risk_profile),
+        severity          = _severity(total_employer_loss, cap),
     ))
 
     return results
@@ -298,6 +356,31 @@ def compute_hc_adjusted_metrics(
 
 # ── Decision logic ────────────────────────────────────────────────────────────
 
+_PROFILE_DOWNGRADE: dict[RiskProfile, RiskProfile] = {
+    RiskProfile.AGGRESSIVE: RiskProfile.MODERATE,
+    RiskProfile.MODERATE:   RiskProfile.CONSERVATIVE,
+}
+
+
+def _stress_flag_constraints(
+    effective_profile: RiskProfile,
+) -> list[AllocationConstraint]:
+    """
+    Translate a critical stress breach into a risk-profile downgrade constraint.
+    AGGRESSIVE → MODERATE → CONSERVATIVE, one step per FLAG iteration.
+    Returns empty list when already at CONSERVATIVE (caller should REJECT instead).
+    """
+    target = _PROFILE_DOWNGRADE.get(effective_profile)
+    if target is None:
+        return []
+    return [AllocationConstraint(
+        constraint_type=ConstraintType.RISK_PROFILE_DOWNGRADE,
+        target=target.value,
+        current_value=0.0,
+        limit=0.0,
+    )]
+
+
 def _drawdown_flag_constraints(
     tickers: list[str],
     weights: np.ndarray,
@@ -329,6 +412,8 @@ def make_decision(
     stress_results: list[StressResult],
     hc_adjusted: HumanCapitalAdjustedMetrics,
     risk_profile: RiskProfile,
+    effective_risk_profile: RiskProfile,
+    regime: MarketRegime,
     flag_iteration: int,
     tickers: list[str],
     weights: np.ndarray,
@@ -336,39 +421,65 @@ def make_decision(
     """
     Deterministic APPROVE / FLAG / REJECT decision.
 
-    REJECT conditions (issue upstream of Allocation — not fixable by reoptimisation):
-      1. flag_iteration >= 3 : retries exhausted
-      2. HC alone causes structural employer breach: hc_fraction > EMPLOYER_LIMIT
-         (no financial reallocation can fix this)
-      3. CRITICAL stress with no concentration violations (inherent risk issue)
+    REJECT conditions (structurally unfixable):
+      1. flag_iteration >= 2 : next FLAG would produce flag_iteration=3 which the
+         schema forbids with a FLAG decision.
+      2. hc_fraction > EMPLOYER_LIMIT : HC alone breaches employer limit.
+      3. CRITICAL stress while already at CONSERVATIVE : no further downgrade possible.
 
-    FLAG conditions (fixable by sending constraints back to Allocation):
-      - Any concentration violation
-      - Max drawdown exceeds the risk-profile cap
+    FLAG conditions (fed back to Allocation as tighter constraints):
+      - Any concentration violation            → per-ticker tighter bounds
+      - Max drawdown exceeds cap               → proportional single-name tightening
+      - CRITICAL stress scenario               → RISK_PROFILE_DOWNGRADE one step:
+          AGGRESSIVE → MODERATE → CONSERVATIVE
+        The effective_risk_profile on the next iteration uses the downgraded gamma,
+        naturally reducing risky weight. When high-risk conditions pass and a fresh
+        pipeline run starts (flag_constraints=[]), the system reverts to the user's
+        stated risk_profile automatically.
 
-    APPROVE: no violations, MDD within cap.
+    APPROVE: no violations, MDD within cap, no critical stress.
     """
-    cap = MAX_DRAWDOWN_CAP[risk_profile]
+    cap = effective_cap(effective_risk_profile, regime)
     drawdown_breach = max_drawdown > cap
     critical_stress = any(r.severity == StressSeverity.CRITICAL for r in stress_results)
 
-    # ── REJECT ──
-    if flag_iteration >= 3:
-        return RiskDecision.REJECT, []
-
+    # ── Hard structural REJECTs (not fixable by re-optimization) ──
     if hc_adjusted.hc_fraction > EMPLOYER_LIMIT:
-        # Human capital alone exceeds employer limit — structurally unfixable
         return RiskDecision.REJECT, []
 
-    if critical_stress and not violations and not drawdown_breach:
-        # Extreme stress with no addressable concentration problem
+    if critical_stress and effective_risk_profile == RiskProfile.CONSERVATIVE:
+        # Already at the most defensive posture — no further downgrade possible.
         return RiskDecision.REJECT, []
 
-    # ── FLAG ──
+    # ── Build flag constraints ──
     flag_constraints: list[AllocationConstraint] = list(violations)
 
     if drawdown_breach:
         flag_constraints += _drawdown_flag_constraints(tickers, weights, max_drawdown, cap)
+
+    if critical_stress:
+        flag_constraints += _stress_flag_constraints(effective_risk_profile)
+
+    # Carry an existing profile downgrade forward so it survives subsequent FLAG
+    # iterations that may only generate other constraint types (e.g. drawdown).
+    if effective_risk_profile != risk_profile and not critical_stress:
+        flag_constraints.append(AllocationConstraint(
+            constraint_type=ConstraintType.RISK_PROFILE_DOWNGRADE,
+            target=effective_risk_profile.value,
+            current_value=0.0,
+            limit=0.0,
+        ))
+
+    # ── Iteration limit ──
+    # Real violations = drawdown breach, concentration violations, or critical stress.
+    # Profile downgrade carry-forward is not a violation — don't penalise a converged
+    # portfolio for carrying state from a prior iteration.
+    if flag_iteration >= 2:
+        real_violations = drawdown_breach or bool(violations) or critical_stress
+        if real_violations:
+            return RiskDecision.REJECT, []
+        else:
+            return RiskDecision.APPROVE, []
 
     if flag_constraints:
         return RiskDecision.FLAG, flag_constraints
@@ -412,6 +523,14 @@ def run_risk(
     universe= ai.universe
     tickers = universe.tickers
 
+    # Effective risk profile: may be downgraded one step by a prior FLAG iteration.
+    # On a fresh pipeline run (flag_constraints=[]) this always equals up.risk_profile,
+    # so the system naturally reverts when high-risk conditions pass.
+    effective_profile = up.risk_profile
+    for fc in ai.flag_constraints:
+        if fc.constraint_type == ConstraintType.RISK_PROFILE_DOWNGRADE:
+            effective_profile = RiskProfile(fc.target)
+
     # Actual financial weights = within-risky weights × risky fraction
     weights = np.array([w.total_weight * ao.risky_weight for w in ao.weights])
     weight_dict = {tickers[i]: float(weights[i]) for i in range(len(tickers))}
@@ -436,6 +555,18 @@ def run_risk(
     mdd = compute_max_drawdown(w_adj, recent_matrix) if recent_matrix.shape[0] > 30 \
           else 0.0
 
+    # ── 3b. Regime detection ──
+    # Compare recent (60-day) portfolio vol to full-sample baseline.
+    # CRISIS/ELEVATED widens the drawdown cap so the system doesn't force
+    # procyclical selling at market bottoms; reverts automatically as vol normalises.
+    if recent_matrix.shape[0] > 30:
+        port_ret_full = recent_matrix @ w_adj
+        regime = detect_regime(port_ret_full)
+    else:
+        regime = MarketRegime.NORMAL
+
+    drawdown_cap = effective_cap(effective_profile, regime)
+
     # ── 4. Liquidity ──
     liq = compute_liquidity_score(weights, tickers, crsp_daily, permno_map)
 
@@ -445,7 +576,7 @@ def run_risk(
 
     stress_results = compute_stress_results(
         weights, tickers, crsp_daily, permno_map,
-        up.risk_profile, hc.employer_ticker,
+        drawdown_cap, hc.employer_ticker,
         employer_fin_weight, hc_frac,
     )
 
@@ -472,20 +603,24 @@ def run_risk(
         stress_results=stress_results,
         hc_adjusted=hc_adj,
         risk_profile=up.risk_profile,
+        effective_risk_profile=effective_profile,
+        regime=regime,
         flag_iteration=ai.flag_iteration,
         tickers=tickers,
         weights=weights,
     )
 
     risk_metrics = RiskMetrics(
-        volatility       = ao.portfolio_statistics.volatility,
-        var_cvar         = var_cvar,
-        max_drawdown     = mdd,
-        factor_exposures = ao.portfolio_statistics.factor_exposures,
-        liquidity_score  = liq,
-        concentration    = flags,
-        hc_adjusted      = hc_adj,
-        stress_results   = stress_results,
+        volatility            = ao.portfolio_statistics.volatility,
+        var_cvar              = var_cvar,
+        max_drawdown          = mdd,
+        factor_exposures      = ao.portfolio_statistics.factor_exposures,
+        liquidity_score       = liq,
+        concentration         = flags,
+        hc_adjusted           = hc_adj,
+        stress_results        = stress_results,
+        market_regime         = regime,
+        effective_drawdown_cap= drawdown_cap,
     )
 
     return RiskOutput(
