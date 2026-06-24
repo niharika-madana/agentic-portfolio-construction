@@ -25,6 +25,10 @@ from data import STORAGE_DIR
 FF12_URL     = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/12_Industry_Portfolios_CSV.zip"
 FF12_PATH    = STORAGE_DIR / "ff12_monthly.parquet"
 
+FF3_URL      = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip"
+MOM_URL      = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_CSV.zip"
+FF_RISK_PATH = STORAGE_DIR / "ff_risk_factors.parquet"
+
 
 def fetch_ff12(force: bool = False) -> Path:
     """
@@ -118,3 +122,100 @@ def fetch_ff12(force: bool = False) -> Path:
     mb = FF12_PATH.stat().st_size / (1024 ** 2)
     print(f"[ff12] Saved ff12_monthly.parquet  {df.shape[0]} rows × {df.shape[1]} cols  ({mb:.3f} MB)")
     return FF12_PATH
+
+
+def _parse_french_csv_section(raw: str, expected_cols: list[str]) -> pd.DataFrame:
+    """
+    Parse the first data section from a Ken French CSV file.
+    Returns a DataFrame with a DatetimeIndex (monthly) and float columns.
+    """
+    lines = raw.splitlines()
+    data_rows: list[list[str]] = []
+    in_data = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if in_data and data_rows:
+                break
+            continue
+        parts = [p.strip() for p in stripped.split(",")]
+        try:
+            date_int = int(parts[0])
+            if 190001 <= date_int <= 209912:
+                in_data = True
+                data_rows.append(parts)
+        except (ValueError, IndexError):
+            continue
+
+    if not data_rows:
+        raise ValueError("No data rows found in Ken French CSV")
+
+    df = pd.DataFrame(data_rows)
+    df = df.apply(lambda col: pd.to_numeric(col, errors="coerce"))
+    df.dropna(how="all", inplace=True)
+    date_col = df.iloc[:, 0].astype(int)
+    df = df.iloc[:, 1: len(expected_cols) + 1]
+    df.columns = expected_cols
+    df.index   = pd.to_datetime(date_col.astype(str), format="%Y%m") + pd.offsets.MonthBegin(0)
+    df.index.name = "date"
+    df.replace(-99.99, float("nan"), inplace=True)
+    df = df / 100.0    # French publishes in percent
+    return df
+
+
+def fetch_ff_risk_factors(force: bool = False) -> Path:
+    """
+    Download Fama-French 3-factor + momentum monthly risk factors from Ken French's
+    data library → data/storage/ff_risk_factors.parquet.
+
+    Columns (decimal, monthly): mktrf, smb, hml, umd, rf
+    Index: DatetimeIndex (month-start)
+
+    Used by agents/shared/core/allocation.py to build FF factor views.
+    """
+    if FF_RISK_PATH.exists() and not force:
+        print("[ff_risk] ff_risk_factors.parquet already exists. Use force=True to refresh.")
+        return FF_RISK_PATH
+
+    print("[ff_risk] Downloading Fama-French 3-factor data from Ken French ...")
+    r3 = requests.get(FF3_URL, timeout=60)
+    r3.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(r3.content)) as zf:
+        csv_name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
+        raw3 = zf.read(csv_name).decode("latin-1")
+
+    df3 = _parse_french_csv_section(raw3, ["mktrf", "smb", "hml", "rf"])
+
+    print("[ff_risk] Downloading Fama-French momentum factor from Ken French ...")
+    rm = requests.get(MOM_URL, timeout=60)
+    rm.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(rm.content)) as zf:
+        csv_name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
+        rawm = zf.read(csv_name).decode("latin-1")
+
+    dfm = _parse_french_csv_section(rawm, ["umd"])
+
+    df = df3.join(dfm[["umd"]], how="inner")
+    df = df[["mktrf", "smb", "hml", "umd", "rf"]]
+
+    df.to_parquet(FF_RISK_PATH)
+    mb = FF_RISK_PATH.stat().st_size / (1024 ** 2)
+    print(f"[ff_risk] Saved ff_risk_factors.parquet  {df.shape[0]} rows × {df.shape[1]} cols  ({mb:.3f} MB)")
+    return FF_RISK_PATH
+
+
+def load_ff_risk_factors(
+    start: str = "2000-01-01",
+    end:   str = "2025-12-31",
+) -> "pd.DataFrame":
+    """
+    Load FF risk factors from parquet. Auto-fetches if missing.
+    Returns DataFrame with columns [mktrf, smb, hml, umd, rf] in decimal (monthly).
+    """
+    import pandas as pd
+    if not FF_RISK_PATH.exists():
+        fetch_ff_risk_factors()
+    df = pd.read_parquet(FF_RISK_PATH)
+    mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
+    return df.loc[mask]

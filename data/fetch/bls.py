@@ -54,7 +54,16 @@ def fetch_bls_oes(force: bool = False) -> Path:
         return BLS_OUT_PATH
 
     print(f"[bls] Downloading BLS OES May 2023 from {BLS_OES_URL} ...")
-    response = requests.get(BLS_OES_URL, timeout=120)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer":  "https://www.bls.gov/oes/tables.htm",
+        "Accept":   "application/zip,application/octet-stream,*/*",
+    }
+    response = requests.get(BLS_OES_URL, headers=headers, timeout=120)
     response.raise_for_status()
     print(f"[bls] Download complete ({len(response.content) / (1024**2):.1f} MB zip)")
 

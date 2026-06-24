@@ -715,7 +715,7 @@ class TestRunComplianceEndToEnd:
     def test_clean_portfolio_passes(self):
         ci = _make_compliance_input()
         ro = _make_risk_output(
-            risk_decision               = RiskDecision.PASS,
+            risk_decision               = RiskDecision.APPROVE,
             portfolio_volatility_annual = 0.15,
         )
         result = run_compliance(ci, ro)
@@ -788,7 +788,7 @@ class TestRunComplianceEndToEnd:
     def test_passed_checks_list_non_empty_on_clean_run(self):
         ci = _make_compliance_input()
         ro = _make_risk_output(
-            risk_decision               = RiskDecision.PASS,
+            risk_decision               = RiskDecision.APPROVE,
             portfolio_volatility_annual = 0.15,
         )
         result = run_compliance(ci, ro)

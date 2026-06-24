@@ -75,9 +75,30 @@ class InvestmentObjective(str, Enum):
 
 
 class RiskDecision(str, Enum):
-    PASS   = "PASS"
-    FLAG   = "FLAG"
-    REJECT = "REJECT"
+    APPROVE = "APPROVE"
+    FLAG    = "FLAG"
+    REJECT  = "REJECT"
+
+
+class StressSeverity(str, Enum):
+    LOW      = "low"
+    MEDIUM   = "medium"
+    HIGH     = "high"
+    CRITICAL = "critical"
+
+
+class ConstraintType(str, Enum):
+    SINGLE_NAME     = "single_name"
+    SECTOR          = "sector"
+    ECONOMIC_SECTOR = "economic_sector"
+    EMPLOYER        = "employer"
+
+
+class RiskProfile(str, Enum):
+    """Maps 1-to-1 with RiskToleranceLevel; used by Allocation/Risk core modules."""
+    CONSERVATIVE = "conservative"
+    MODERATE     = "moderate"
+    AGGRESSIVE   = "aggressive"
 
 
 class ComplianceStatus(str, Enum):
@@ -360,6 +381,161 @@ class AllocationAgentOutput(BaseModel):
         for ticker in p:
             if ticker not in self.allocation_rationale:
                 raise ValueError(f"Missing rationale for portfolio position: {ticker}")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Internal pipeline types — Allocation ↔ Risk feedback loop
+# (Not consumed directly by Compliance; bridged via adapters.py)
+# ---------------------------------------------------------------------------
+
+class HumanCapitalInput(BaseModel):
+    """HC inputs for BMS optimizer. Built from ProfileAgentOutput by adapters.py."""
+    present_value:        float = Field(..., gt=0, description="PV of future labor income (H)")
+    employer_ticker:      str   = Field(description="Sector-proxy ETF (e.g. XLK) when employer not publicly traded")
+    employer_sector:      str   = Field(description="GICS sector of employer")
+    income_volatility:    float = Field(..., ge=0, description="Annualised std dev of earnings shocks (σ)")
+    income_beta:          float = Field(description="β of income to equity market")
+    years_to_retirement:  int   = Field(..., gt=0)
+    discount_rate:        float = Field(..., gt=0, description="FRED DGS10 rate used to discount HC")
+
+
+class UserProfile(BaseModel):
+    """Internal user profile consumed by Allocation / Risk core modules."""
+    financial_wealth: float          = Field(..., gt=0, description="Total investable financial wealth (W)")
+    human_capital:    HumanCapitalInput
+    risk_profile:     RiskProfile
+
+
+class InstrumentUniverse(BaseModel):
+    """Pre-approved ETF whitelist with market data for the BL optimizer."""
+    tickers:             list[str]        = Field(..., min_length=2)
+    market_cap_weights:  dict[str, float] = Field(description="ticker → AUM-derived weight, sums to 1.0")
+    sectors:             dict[str, str]   = Field(description="ticker → GICS sector")
+
+
+class AllocationConstraint(BaseModel):
+    """A single violated constraint returned by Risk on a FLAG decision."""
+    constraint_type: ConstraintType
+    target:          str   = Field(description="Ticker or sector name")
+    current_value:   float
+    limit:           float
+
+
+class AllocationInput(BaseModel):
+    """Allocation Agent input — first run and FLAG re-entry."""
+    user_profile:      UserProfile
+    universe:          InstrumentUniverse
+    flag_constraints:  list[AllocationConstraint] = Field(default_factory=list)
+    flag_iteration:    int = Field(default=0, ge=0, le=3)
+
+
+class WeightDecomposition(BaseModel):
+    """Per-instrument weight decomposed into three sources."""
+    ticker:               str
+    total_weight:         float = Field(..., ge=0.0, le=1.0)
+    equilibrium_baseline: float
+    view_tilt:            float
+    human_capital_offset: float
+
+
+class FactorExposures(BaseModel):
+    """Fama-French three-factor + momentum exposures."""
+    market_beta: float
+    smb:         float
+    hml:         float
+    mom:         float
+
+
+class PortfolioStatistics(BaseModel):
+    expected_return: float
+    volatility:      float = Field(..., ge=0)
+    sharpe_ratio:    float
+    factor_exposures: FactorExposures
+
+
+class AllocationOutput(BaseModel):
+    """Allocation Agent → Risk Agent internal handoff."""
+    allocation_input:     AllocationInput
+    weights:              list[WeightDecomposition]
+    risky_weight:         float = Field(..., ge=0.0, le=1.0)
+    safe_weight:          float = Field(..., ge=0.0, le=1.0)
+    portfolio_statistics: PortfolioStatistics
+    rationale:            str
+
+    @model_validator(mode="after")
+    def _weights_sum_to_one(self) -> "AllocationOutput":
+        total = sum(w.total_weight for w in self.weights)
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"Portfolio weights must sum to 1.0, got {total:.6f}")
+        return self
+
+    @model_validator(mode="after")
+    def _risky_safe_partition(self) -> "AllocationOutput":
+        if abs(self.risky_weight + self.safe_weight - 1.0) > 1e-6:
+            raise ValueError("risky_weight + safe_weight must equal 1.0")
+        return self
+
+
+class VaRMetrics(BaseModel):
+    var_95:  float
+    var_99:  float
+    cvar_95: float
+    cvar_99: float
+
+
+class ConcentrationFlags(BaseModel):
+    single_name_breaches:     list[str] = Field(default_factory=list)
+    sector_breaches:          list[str] = Field(default_factory=list)
+    economic_sector_breaches: list[str] = Field(default_factory=list)
+    employer_breach:          bool = False
+
+
+class StressResult(BaseModel):
+    scenario:            str
+    portfolio_loss:      float = Field(..., ge=0)
+    threshold_breached:  bool
+    severity:            StressSeverity
+
+
+class HumanCapitalAdjustedMetrics(BaseModel):
+    total_wealth:              float
+    hc_fraction:               float = Field(..., ge=0, le=1)
+    effective_equity_exposure: float
+    economic_sector_exposures: dict[str, float]
+    employer_concentration:    float
+
+
+class RiskMetrics(BaseModel):
+    volatility:       float = Field(..., ge=0)
+    var_cvar:         VaRMetrics
+    max_drawdown:     float = Field(..., ge=0)
+    factor_exposures: FactorExposures
+    liquidity_score:  float = Field(..., ge=0, le=1)
+    concentration:    ConcentrationFlags
+    hc_adjusted:      HumanCapitalAdjustedMetrics
+    stress_results:   list[StressResult]
+
+
+class RiskOutput(BaseModel):
+    """Internal Risk → Allocation feedback object (FLAG loop). Bridged to RiskAgentOutput for Compliance."""
+    decision:             RiskDecision
+    allocation_output:    AllocationOutput
+    risk_metrics:         RiskMetrics
+    reasoning_trace:      str
+    constraints_violated: list[AllocationConstraint] = Field(default_factory=list)
+    flag_iteration:       int = Field(default=0, ge=0, le=3)
+
+    @model_validator(mode="after")
+    def _flag_requires_constraints(self) -> "RiskOutput":
+        if self.decision == RiskDecision.FLAG and not self.constraints_violated:
+            raise ValueError("FLAG decision must include at least one violated constraint")
+        return self
+
+    @model_validator(mode="after")
+    def _flag_iteration_not_exhausted(self) -> "RiskOutput":
+        if self.decision == RiskDecision.FLAG and self.flag_iteration >= 3:
+            raise ValueError("FLAG iteration limit (3) reached — decision must be REJECT, not FLAG")
         return self
 
 

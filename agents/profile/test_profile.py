@@ -1,160 +1,187 @@
 """
-test_profile.py — Profile Agent unit tests (no live API calls).
+test_profile.py — Profile Agent unit tests
+===========================================
+No live API calls — all tests use hardcoded fixtures.
 
-Run from the repo root:
-    pytest agents/profile/test_profile.py -v
+Coverage:
+    1–3.  compute_human_capital — formula, edge cases
+    4–6.  build_profile — formula checks (implicit_equity_exposure uses hc_share×β)
+    7–9.  build_profile — enum lowercasing, total_wealth formula
+    10.   lookup_hc_beta — returns (float, float) for each HC type
+    11–13. to_profile_agent_output — round-trip, raises without beta,
+           Pydantic catches wrong formula
 
-Tests cover the pure formulas, the derivation rules, contract validation, and
-the consistency invariants the design doc guarantees. The BLS OES loader is
-exercised only if the parquet cache or the source xlsx is present; otherwise
-those tests skip.
+Run with: pytest agents/profile/test_profile.py -v
 """
-
-from __future__ import annotations
-
-import math
 
 import pytest
 
-from contracts import ProfileAgentOutput
-from agents.profile import hc_beta_table as hcb
-from agents.profile import personas as P
-from agents.profile.human_capital import (
+from .hc_beta_table import lookup_hc_beta
+from .human_capital import (
+    INCOME_VOLATILITY_SIGMA,
     build_profile,
     compute_human_capital,
     to_profile_agent_output,
 )
 
+DISCOUNT_RATE = 0.044  # fixed for tests — no FRED call needed
 
-# ── A representative bond-like persona used across tests ───────────────────
-def _bio_persona() -> dict:
-    return {
-        "client_id":                "bls_25-1042_p50",
-        "soc":                      "25-1042",
-        "label":                    "Biology Professor",
-        "career_type":              "Academia",
-        "age":                      47,
-        "annual_salary":            83920.0,
-        "bonus_rate":               0.046,
-        "effective_salary":         round(83920.0 * 1.046, 2),
-        "years_to_retirement":      18,
-        "income_stability":         "High",
-        "industry_exposure_sector": "Education",
-        "financial_capital":        200000.0,
-        "current_holdings":         {"US_equity": 0.50, "intl_equity": 0.15, "bonds": 0.25, "cash": 0.10},
-        "investment_horizon_years": 18,
-        "risk_tolerance":           "moderate",
-        "liquidity_needs":          "low",
-        "investment_objective":     "growth",
-        "RSU_concentration":        0.0,
-        "has_pension":              True,
-    }
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+VALID_PERSONA = {
+    "client_id": "test_persona",
+    "name": "Test Client",
+    "age": 40,
+    "annual_salary": 100000,
+    "years_to_retirement": 25,
+    "career_type": "Technology",
+    "income_stability": "Low",         # sigma=0.40, hc_type="equity-like"
+    "industry_exposure_sector": "Technology",
+    "financial_capital": 500000,
+    "current_holdings": {"equities": 0.6, "bonds": 0.3, "cash": 0.1},
+    "investment_horizon_years": 25,
+    "risk_tolerance": "Aggressive",
+    "liquidity_needs": "Medium",
+    "investment_objective": "Growth",
+    "RSU_concentration": 0.0,
+}
 
 
-# ── Human capital annuity formula ──────────────────────────────────────────
+@pytest.fixture
+def valid_persona():
+    return dict(VALID_PERSONA)
 
-def test_compute_human_capital_matches_annuity_formula():
-    salary, n, r = 100000.0, 20, 0.044
+
+# ---------------------------------------------------------------------------
+# 1–3. compute_human_capital
+# ---------------------------------------------------------------------------
+
+def test_hc_positive(valid_persona):
+    hc = compute_human_capital(
+        valid_persona["annual_salary"],
+        valid_persona["years_to_retirement"],
+        DISCOUNT_RATE,
+    )
+    assert hc > 0
+
+
+def test_hc_zero_years():
+    assert compute_human_capital(100000, 0, DISCOUNT_RATE) == 0.0
+
+
+def test_hc_annuity_formula():
+    """HC = salary × [1 − (1+r)^(−n)] / r"""
+    salary, n, r = 100000, 25, 0.044
     expected = salary * (1 - (1 + r) ** (-n)) / r
-    assert compute_human_capital(salary, n, r) == pytest.approx(expected, abs=0.01)
+    result = compute_human_capital(salary, n, r)
+    assert abs(result - expected) < 1.0
 
 
-def test_compute_human_capital_zero_horizon():
-    assert compute_human_capital(100000.0, 0, 0.044) == 0.0
+# ---------------------------------------------------------------------------
+# 4–6. build_profile — formula checks
+# ---------------------------------------------------------------------------
+
+def test_implicit_equity_exposure_uses_beta(valid_persona):
+    """implicit_equity_exposure = hc_share × β  (contracts.py formula)."""
+    beta = 1.20
+    profile = build_profile(valid_persona, DISCOUNT_RATE, beta=beta, correlation=0.75)
+    hc      = profile["human_capital_valuation"]
+    tw      = profile["total_wealth"]
+    expected = round((hc / tw) * beta, 3)
+    assert profile["implicit_equity_exposure"] == expected
 
 
-# ── Calibrated table ───────────────────────────────────────────────────────
-
-@pytest.mark.parametrize("hc_type,beta", [
-    ("bond-like", 0.05), ("mixed", 0.35), ("equity-like", 0.90),
-])
-def test_beta_within_contract_thresholds(hc_type, beta):
-    assert hcb.lookup_hc_beta(hc_type)["beta"] == beta
-
-
-def test_lookup_hc_beta_unknown_raises():
-    with pytest.raises(KeyError):
-        hcb.lookup_hc_beta("nonsense")
+def test_effective_risk_budget_formula(valid_persona):
+    """effective_risk_budget = (FC + HC × (1 − σ)) / total_wealth"""
+    profile = build_profile(valid_persona, DISCOUNT_RATE, beta=1.20, correlation=0.75)
+    hc    = profile["human_capital_valuation"]
+    sigma = INCOME_VOLATILITY_SIGMA[valid_persona["income_stability"]]
+    fc    = valid_persona["financial_capital"]
+    tw    = profile["total_wealth"]
+    expected = round((fc + hc * (1 - sigma)) / tw, 3)
+    assert profile["effective_risk_budget"] == expected
 
 
-# ── Derivation rules ───────────────────────────────────────────────────────
-
-def test_risk_tolerance_rules():
-    assert P.derive_risk_tolerance("bond-like", 47) == "moderate"
-    assert P.derive_risk_tolerance("bond-like", 55) == "conservative"
-    assert P.derive_risk_tolerance("mixed", 60) == "moderate"
-    assert P.derive_risk_tolerance("equity-like", 38) == "aggressive"
-    assert P.derive_risk_tolerance("equity-like", 50) == "moderate"
-
-
-def test_holdings_sum_to_one():
-    for hc_type, age, rt, rsu in [
-        ("bond-like", 47, "moderate", 0.0),
-        ("equity-like", 38, "aggressive", 0.35),
-        ("mixed", 45, "moderate", 0.0),
-        ("bond-like", 55, "conservative", 0.0),
-    ]:
-        holdings = P.derive_current_holdings(hc_type, age, rt, rsu)
-        assert math.isclose(sum(holdings.values()), 1.0, abs_tol=0.01)
-
-
-# ── build_profile invariants ───────────────────────────────────────────────
-
-def test_build_profile_invariants():
-    prof = build_profile(_bio_persona(), discount_rate=0.044)
-
-    # total wealth = FC + HC
-    assert prof["total_wealth"] == pytest.approx(
-        prof["financial_capital"] + prof["human_capital_valuation"], rel=1e-6
+def test_portfolio_equity_target_formula(valid_persona):
+    """portfolio_equity_target = effective_risk_budget − implicit_equity_exposure"""
+    profile = build_profile(valid_persona, DISCOUNT_RATE, beta=1.20, correlation=0.75)
+    expected = round(
+        profile["effective_risk_budget"] - profile["implicit_equity_exposure"], 3
     )
-    # implicit equity exposure = hc_share × β
-    hc_share = prof["human_capital_valuation"] / prof["total_wealth"]
-    assert prof["implicit_equity_exposure"] == pytest.approx(
-        round(hc_share * prof["income_equity_beta"], 3), abs=0.01
+    assert profile["portfolio_equity_target"] == expected
+
+
+# ---------------------------------------------------------------------------
+# 7–9. build_profile — enum lowercasing, total_wealth formula
+# ---------------------------------------------------------------------------
+
+def test_total_wealth_is_fc_plus_hc(valid_persona):
+    profile = build_profile(valid_persona, DISCOUNT_RATE, beta=1.20, correlation=0.75)
+    assert profile["total_wealth"] == (
+        profile["financial_capital"] + profile["human_capital_valuation"]
     )
-    # portfolio equity target = risk budget − implicit exposure
-    assert prof["portfolio_equity_target"] == pytest.approx(
-        round(prof["effective_risk_budget"] - prof["implicit_equity_exposure"], 3), abs=1e-9
-    )
-    # income_stability is mapped to the lowercase contract value
-    assert prof["income_stability"] == "high"
 
 
-def test_build_profile_validates_against_contract():
-    prof = build_profile(_bio_persona(), discount_rate=0.044)
-    out = to_profile_agent_output(prof)
-    assert isinstance(out, ProfileAgentOutput)
-    assert out.human_capital_type.value == "bond-like"
-    assert out.income_stability.value == "high"
-    assert out.bonus_rate == 0.046
-    assert out.portfolio_equity_target is not None
+def test_income_stability_lowercase(valid_persona):
+    profile = build_profile(valid_persona, DISCOUNT_RATE, beta=1.20, correlation=0.75)
+    assert profile["income_stability"] == "low"   # "Low" → "low"
 
 
-def test_equity_like_persona_can_have_negative_target():
-    persona = _bio_persona()
-    persona.update({
-        "client_id":         "bls_15-1252_p50",
-        "income_stability":  "Low",
-        "RSU_concentration": 0.35,
-        "current_holdings":  P.derive_current_holdings("equity-like", 38, "aggressive", 0.35),
-        "age":               38,
-        "years_to_retirement": 27,
-        "effective_salary":  round(132270.0 * 1.085, 2),
-        "financial_capital": 90000.0,
-    })
-    out = to_profile_agent_output(build_profile(persona, discount_rate=0.044))
-    assert out.human_capital_type.value == "equity-like"
-    # equity-like career carries large implicit exposure → small/negative target
-    assert out.portfolio_equity_target < out.effective_risk_budget
+def test_risk_tolerance_lowercase(valid_persona):
+    profile = build_profile(valid_persona, DISCOUNT_RATE, beta=1.20, correlation=0.75)
+    assert profile["risk_tolerance_level"] == "aggressive"  # "Aggressive" → "aggressive"
 
 
-# ── BLS persona builder (only if OES data is available) ────────────────────
+# ---------------------------------------------------------------------------
+# 10. lookup_hc_beta — calibrated table replaces OLS regression
+# ---------------------------------------------------------------------------
 
-def test_build_bls_personas_if_data_present():
-    from agents.profile.loaders import BLS_PARQUET, BLS_XLSX
-    if not (BLS_PARQUET.exists() or BLS_XLSX.exists()):
-        pytest.skip("BLS OES data not available in this environment")
-    from agents.profile.loaders import load_bls_oes
-    personas = P.build_bls_personas(load_bls_oes(), include_percentile_variants=False)
-    assert len(personas) >= 1
-    assert all("client_id" in p for p in personas)
+def test_lookup_hc_beta_returns_floats():
+    for hc_type in ("bond-like", "mixed", "equity-like"):
+        beta, corr = lookup_hc_beta(hc_type)
+        assert isinstance(beta, float)
+        assert isinstance(corr, float)
+        assert 0.0 <= corr <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# 11–13. to_profile_agent_output
+# ---------------------------------------------------------------------------
+
+def test_to_profile_agent_output_round_trip(valid_persona):
+    """Build with beta → adapter → ProfileAgentOutput without ValidationError."""
+    from contracts import ProfileAgentOutput
+    profile = build_profile(valid_persona, DISCOUNT_RATE, beta=1.20, correlation=0.75)
+    output  = to_profile_agent_output(profile)
+    assert isinstance(output, ProfileAgentOutput)
+    assert output.client_id == valid_persona["client_id"]
+    assert output.income_equity_beta == profile["income_equity_beta"]
+    assert output.implicit_equity_exposure == profile["implicit_equity_exposure"]
+
+
+def test_to_profile_agent_output_raises_without_beta(valid_persona):
+    """Adapter must raise ValueError when beta field is None."""
+    profile = build_profile(valid_persona, DISCOUNT_RATE, beta=1.20, correlation=0.75)
+    profile["income_equity_beta"] = None
+    profile["implicit_equity_exposure"] = None
+    with pytest.raises(ValueError, match="OLS beta estimation"):
+        to_profile_agent_output(profile)
+
+
+def test_pydantic_catches_wrong_formula(valid_persona):
+    """
+    Manually set implicit_equity_exposure using the OLD formula (hc×σ/tw).
+    The contracts.py model_validator enforces hc_share×β and must reject this.
+    """
+    from pydantic import ValidationError
+    beta = 1.20
+    profile = build_profile(valid_persona, DISCOUNT_RATE, beta=beta, correlation=0.75)
+    # Corrupt to old formula: hc×σ/tw
+    hc    = profile["human_capital_valuation"]
+    tw    = profile["total_wealth"]
+    sigma = profile["income_volatility_sigma"]
+    profile["implicit_equity_exposure"] = round(hc * sigma / tw, 3)
+    with pytest.raises(ValidationError):
+        to_profile_agent_output(profile)

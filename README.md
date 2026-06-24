@@ -31,9 +31,9 @@ The system runs five specialized agents in sequence to produce a compliance-clea
 ┌─────────────────┐     ┌──────────────────┐
 │  Profile Agent  │     │  Research Agent  │
 │                 │     │                  │
-│  BLS OES → HC  │     │  FRED → PELT     │
-│  SCF → FC      │     │  KMeans → XGB    │
-│  β table → exp.│     │  Regime label    │
+│  BLS OES → HC   │     │  FRED → PELT     │
+│  SCF → FC       │     │  KMeans → XGB    │
+│  β table → exp. │     │  Regime label    │
 └────────┬────────┘     └────────┬─────────┘
          │ ProfileAgentOutput    │ MacroRegimeSnapshot
          └──────────┬────────────┘
