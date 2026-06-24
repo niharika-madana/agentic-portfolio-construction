@@ -1,107 +1,150 @@
 """
-research_agent.py — Research Agent
-=====================================
-Entry point: run_research_agent() → MacroRegimeSnapshot
+research_agent.py — Research Agent entry point (Agent 2 of 5).
 
-Orchestrates the full Research Agent pipeline:
-    1. Pull 13 FRED macro series
-    2. Engineer features (z-scores, log-transforms, first diffs, YoY)
-    3. PELT change-point detection
-    4. Segment fingerprinting + K-means clustering
-    5. XGBoost regime mapping (5 anchor windows)
-    6. 6-month rolling majority vote (smoothing)
-    7. HMM & GMM comparison (optional — for paper validation)
-    8. Pydantic validation + regime sequence construction
-    9. Save outputs to agents/research/
-   10. Convert latest entry to MacroRegimeSnapshot via adapters.py
+run_research_agent() runs the four-stage deterministic pipeline on 13 FRED macro
+series and returns a validated MacroRegimeSnapshot for the most recent month:
 
-Returns MacroRegimeSnapshot — typed, validated Pydantic object
-ready to be passed directly to orchestrator.run_pipeline().
+  FRED macro (cache) → features → PELT breaks → K-means sanity clustering
+  → XGBoost regime mapping → 6-month majority-vote smoothing → Pydantic
+
+Side-effect outputs (design doc §Implementation Notes):
+  agents/research/fred_macro_regimes.csv      full smoothed feature matrix
+  agents/research/regime_sequence.json        validated date-keyed sequence
+  agents/research/macro_regime_snapshot.json  most recent MacroRegimeSnapshot
+  data/storage/fred_macro_regimes.parquet     feature matrix for downstream agents
+
+The returned snapshot feeds straight into orchestrator.run_all(personas, macro).
 """
 
+from __future__ import annotations
+
 import json
-import os
+from pathlib import Path
 
-from .adapters import to_macro_regime_snapshot
-from .detection import cluster_segments, detect_change_points
-from .features import engineer_features
-from .loaders import pull_fred_data
-from .model_comparison import run_model_comparison
-from .regime_model import build_regime_sequence, map_regimes_xgboost, smooth_regimes
+from contracts import MacroRegimeSnapshot
 
-OUTPUT_DIR = "agents/research"
+from agents.research.adapters import (
+    add_derived_fields,
+    build_regime_sequence,
+    build_snapshot,
+)
+from agents.research.detection import detect_change_points
+from agents.research.features import build_features
+from agents.research.loaders import load_crsp, load_macro_data
+from agents.research.regime_model import (
+    cluster_segments,
+    smooth_regimes,
+    train_and_predict,
+)
+
+_THIS_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = _THIS_DIR.parent.parent
+STORAGE_DIR = PROJECT_ROOT / "data" / "storage"
+
+CSV_OUTPUT = _THIS_DIR / "fred_macro_regimes.csv"
+SEQUENCE_OUTPUT = _THIS_DIR / "regime_sequence.json"
+SNAPSHOT_OUTPUT = _THIS_DIR / "macro_regime_snapshot.json"
+PARQUET_OUTPUT = STORAGE_DIR / "fred_macro_regimes.parquet"
+
+
+def _validate_crsp(features_df) -> None:
+    """Optional CRSP return validation — prints avg monthly return per regime."""
+    crsp = load_crsp()
+    if crsp is None or "vwretd" not in getattr(crsp, "columns", []):
+        return
+    validation_df = features_df[["regime_label_smoothed"]].join(crsp[["vwretd"]], how="left")
+    summary = (
+        validation_df.groupby("regime_label_smoothed")["vwretd"]
+        .agg(["mean", "std", "count"])
+        .rename(columns={"mean": "Avg Monthly Return", "std": "Std Dev", "count": "Months"})
+    )
+    print("\n=== Avg Monthly Market Return per Regime (CRSP) ===")
+    print(summary.to_string())
+
+
+def _save_outputs(features_df, regime_sequence: dict, snapshot: MacroRegimeSnapshot) -> None:
+    _THIS_DIR.mkdir(parents=True, exist_ok=True)
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    features_df.to_csv(CSV_OUTPUT)
+    print(f"Saved → {CSV_OUTPUT}")
+
+    try:
+        features_df.to_parquet(PARQUET_OUTPUT)
+        print(f"Saved → {PARQUET_OUTPUT}")
+    except Exception as e:  # pragma: no cover - optional dependency path
+        print(f"Parquet export skipped ({e}).")
+
+    with open(SEQUENCE_OUTPUT, "w") as f:
+        json.dump(regime_sequence, f, indent=2)
+    print(f"Saved → {SEQUENCE_OUTPUT}")
+
+    with open(SNAPSHOT_OUTPUT, "w") as f:
+        f.write(snapshot.model_dump_json(indent=2))
+    print(f"Saved → {SNAPSHOT_OUTPUT}")
 
 
 def run_research_agent(
-    fred_api_key,
-    pelt_penalty=10,
-    run_comparison=True,
-    crsp_path="crsp_market_index.csv",
-    output_dir=OUTPUT_DIR,
-):
+    fred_api_key: str | None = None,
+    pen: float = 10.0,
+    save: bool = True,
+    validate_crsp: bool = True,
+    compare_models: bool = False,
+) -> MacroRegimeSnapshot:
     """
     Run the full Research Agent pipeline.
 
-    Args:
-        fred_api_key:   FRED API key (free at https://fred.stlouisfed.org/docs/api/)
-        pelt_penalty:   PELT regularisation penalty (default 10; higher = fewer breaks)
-        run_comparison: Whether to run HMM/GMM model comparison (default True)
-        crsp_path:      Path to crsp_market_index.csv (for CRSP validation)
-        output_dir:     Directory to save output files
+    Parameters
+    ----------
+    fred_api_key : str | None
+        Only needed on a cold cache. When data/storage/fred_macro.parquet exists,
+        no API call is made.
+    pen : float
+        PELT penalty (higher → fewer structural breaks).
+    save : bool
+        Persist CSV / JSON / parquet outputs when True.
+    validate_crsp : bool
+        Run the optional CRSP return validation when True.
+    compare_models : bool
+        Run the optional HMM/GMM benchmark when True.
 
-    Returns:
-        MacroRegimeSnapshot — latest validated snapshot, pass directly to
-                              orchestrator.run_pipeline(profile, macro)
+    Returns
+    -------
+    MacroRegimeSnapshot
+        Validated snapshot for the most recent month.
     """
-    # Step 1: Pull FRED data
-    macro_df = pull_fred_data(fred_api_key)
+    macro_df = load_macro_data(fred_api_key)
+    features_df, signal_cols = build_features(macro_df)
 
-    # Step 2: Feature engineering
-    features_df = engineer_features(macro_df)
+    break_dates, _ = detect_change_points(features_df, signal_cols, pen=pen)
+    cluster_segments(features_df, signal_cols, break_dates)  # sanity check
 
-    # Step 3: PELT change-point detection
-    break_dates = detect_change_points(features_df, pen=pelt_penalty)
+    _, feat_importance = train_and_predict(features_df, signal_cols)
+    print("\n=== Feature Importance ===")
+    print(feat_importance.to_string())
 
-    # Step 4: Segment clustering
-    seg_df, best_k = cluster_segments(features_df, break_dates)
+    smooth_regimes(features_df)
+    add_derived_fields(features_df)
 
-    # Step 5: XGBoost regime mapping
-    features_df, xgb = map_regimes_xgboost(features_df)
-
-    # Step 6: Regime smoothing
-    features_df = smooth_regimes(features_df)
-
-    # Step 7: HMM & GMM comparison (optional — paper validation only)
-    if run_comparison:
-        print("\n=== Running HMM & GMM Model Comparison ===")
-        features_df = run_model_comparison(features_df, crsp_path=crsp_path)
-
-    # Step 8: Pydantic validation + regime sequence construction
     regime_sequence = build_regime_sequence(features_df)
+    snapshot = build_snapshot(features_df)
 
-    # Step 9: Save outputs
-    os.makedirs(output_dir, exist_ok=True)
+    print("\n=== MacroRegimeSnapshot (most recent month) ===")
+    print(snapshot.model_dump_json(indent=2))
 
-    csv_path = os.path.join(output_dir, "fred_macro_regimes.csv")
-    features_df.to_csv(csv_path)
-    print(f"Saved → {csv_path}")
+    if compare_models:
+        from agents.research.model_comparison import compare_models as _cmp
+        _cmp(features_df, signal_cols)
 
-    json_path = os.path.join(output_dir, "regime_sequence.json")
-    with open(json_path, "w") as f:
-        json.dump(regime_sequence, f, indent=2)
-    print(f"Saved → {json_path}")
+    if validate_crsp:
+        _validate_crsp(features_df)
 
-    last_3 = dict(list(regime_sequence.items())[-3:])
-    print("\n=== Last 3 Months in Regime Sequence ===")
-    print(json.dumps(last_3, indent=2))
-
-    # Step 10: Convert to MacroRegimeSnapshot (latest date)
-    snapshot = to_macro_regime_snapshot(regime_sequence)
-
-    print(f"\nMacroRegimeSnapshot — {snapshot.as_of}")
-    print(f"  Regime:     {snapshot.regime_label} (confidence: {snapshot.regime_confidence:.1%})")
-    print(f"  Regime since: {snapshot.regime_shift_date}")
-    print(f"  Low confidence: {snapshot.is_low_confidence}")
-    print(f"  Regime change:  {snapshot.regime_change_detected}")
+    if save:
+        _save_outputs(features_df, regime_sequence, snapshot)
 
     return snapshot
+
+
+if __name__ == "__main__":  # pragma: no cover
+    snap = run_research_agent()
+    print(f"\nRegime: {snap.regime_label} | confidence: {snap.regime_confidence:.3f}")

@@ -1,102 +1,148 @@
 """
-adapters.py — Research Agent
-==============================
-Converts the Research Agent's internal regime_sequence dict output
-into a contracts.py MacroRegimeSnapshot for the orchestrator.
+adapters.py — Pydantic validation and the downstream MacroRegimeSnapshot.
 
-This is the Research Agent's equivalent of the Profile Agent's
-to_profile_agent_output() — it bridges internal data structures
-to the typed inter-agent contract.
+Two schemas:
+
+  RegimeRecord          research-internal per-row schema; validates every month
+                        of the smoothed regime sequence before it is written to
+                        disk. Carries vix and indpro for inspection.
+  MacroRegimeSnapshot   the shared downstream contract (contracts.py), built for
+                        the most recent month and consumed by the Allocation and
+                        Risk agents via the orchestrator. Its is_low_confidence
+                        and regime_change_detected flags are derived by the
+                        contract's own validator.
+
+add_derived_fields() computes regime_volatility (6-month rolling std of the
+credit spread), prior_regime, and regime_shift_date on the feature frame.
 """
 
-import os
-import sys
+from __future__ import annotations
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
-from datetime import date
+import pandas as pd
+from pydantic import BaseModel, Field, field_validator
 
 from contracts import MacroRegimeSnapshot
 
+VALID_REGIME_LABELS = {
+    "Early Recovery",
+    "Late-Cycle Expansion",
+    "Financial Crisis & ZLB",
+    "Moderate Expansion",
+    "Inflation Shock",
+}
 
-def to_macro_regime_snapshot(
-    regime_sequence: dict,
-    as_of: date = None,
-) -> MacroRegimeSnapshot:
+
+class RegimeRecord(BaseModel):
+    """Per-row validation schema for the full regime sequence."""
+    regime_label:      str
+    prior_regime:      str
+    regime_shift_date: str
+    regime_confidence: float = Field(ge=0.0, le=1.0)
+    regime_volatility: float = Field(ge=0.0)
+    yield_curve:       float
+    term_spread:       float
+    fed_funds:         float
+    unemployment:      float
+    cpi:               float
+    credit_spread:     float
+    vix:               float
+    indpro:            float
+
+    @field_validator("regime_label")
+    @classmethod
+    def _label_valid(cls, v):
+        if v not in VALID_REGIME_LABELS:
+            raise ValueError(f"Invalid regime label: '{v}'")
+        return v
+
+    @field_validator("prior_regime")
+    @classmethod
+    def _prior_valid(cls, v):
+        if v != "None" and v not in VALID_REGIME_LABELS:
+            raise ValueError(f"Invalid prior_regime: '{v}'")
+        return v
+
+
+def add_derived_fields(features_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert the Research Agent's regime_sequence dict to a MacroRegimeSnapshot.
-
-    The regime_sequence is date-keyed (YYYY-MM-DD strings → regime record dicts),
-    produced by build_regime_sequence() and validated against RegimeRecord before
-    being written to disk. This function picks the most recent validated entry
-    and maps it to the contracts.py MacroRegimeSnapshot type.
-
-    Args:
-        regime_sequence: date-keyed dict from build_regime_sequence()
-        as_of:           snapshot date (defaults to the latest key in the dict)
-
-    Returns:
-        MacroRegimeSnapshot — validated, ready for the orchestrator's run_pipeline()
-
-    Raises:
-        ValueError  — if regime_sequence is empty
-        KeyError    — if as_of date is not present in regime_sequence
-        ValidationError — if the record fails MacroRegimeSnapshot constraints
+    Add regime_volatility, prior_regime, and regime_shift_date to the smoothed
+    feature frame. Requires regime_label_smoothed to be present.
     """
-    if not regime_sequence:
-        raise ValueError(
-            "regime_sequence is empty — Research Agent produced no validated rows. "
-            "Check that pull_fred_data() succeeded and build_regime_sequence() "
-            "did not fail all Pydantic validation rows."
-        )
-
-    if as_of is None:
-        latest_key = max(regime_sequence.keys())
-    else:
-        latest_key = as_of.isoformat()
-        if latest_key not in regime_sequence:
-            raise KeyError(
-                f"Date {latest_key} not found in regime_sequence. "
-                f"Available range: {min(regime_sequence)} → {max(regime_sequence)}"
-            )
-
-    row           = regime_sequence[latest_key]
-    snapshot_date = date.fromisoformat(latest_key)
-
-    # MacroRegimeSnapshot's @model_validator sets is_low_confidence and
-    # regime_change_detected automatically from confidence and prior_regime —
-    # no need to pass them.
-    return MacroRegimeSnapshot(
-        as_of             = snapshot_date,
-        regime_label      = row["regime_label"],
-        prior_regime      = row["prior_regime"],
-        regime_shift_date = date.fromisoformat(row["regime_shift_date"]),
-        regime_confidence = row["regime_confidence"],
-        regime_volatility = row["regime_volatility"],
-        yield_curve       = row["yield_curve"],
-        term_spread       = row["term_spread"],
-        fed_funds         = row["fed_funds"],
-        unemployment      = row["unemployment"],
-        cpi               = row["cpi"],
-        credit_spread     = row["credit_spread"],
-        # vix and indpro are in RegimeRecord but not in MacroRegimeSnapshot
+    features_df["regime_volatility"] = (
+        features_df["credit_spread"].rolling(6, min_periods=1).std().fillna(0).round(4)
+    )
+    features_df["prior_regime"] = (
+        features_df["regime_label_smoothed"].shift(1).fillna("None")
     )
 
+    shift_dates, current_start = [], features_df.index[0]
+    smoothed = features_df["regime_label_smoothed"]
+    for i, date_idx in enumerate(features_df.index):
+        if i == 0:
+            current_start = date_idx
+        elif smoothed.iloc[i] != smoothed.iloc[i - 1]:
+            current_start = date_idx
+        shift_dates.append(current_start)
+    features_df["regime_shift_date"] = shift_dates
+    return features_df
 
-def load_regime_snapshot_from_json(
-    json_path: str,
-    as_of: date = None,
-) -> MacroRegimeSnapshot:
+
+def build_regime_sequence(features_df: pd.DataFrame) -> dict[str, dict]:
     """
-    Load a saved regime_sequence.json from disk and return the snapshot
-    for the given date (or the latest date if as_of is None).
-
-    Convenience wrapper for the orchestrator when the Research Agent
-    has already run and saved its output.
+    Validate every month against RegimeRecord and return a date-keyed dict of
+    validated records. Rows that fail validation are logged and skipped.
     """
-    import json
+    regime_sequence: dict[str, dict] = {}
+    passed = failed = 0
 
-    with open(json_path, "r") as f:
-        regime_sequence = json.load(f)
+    for date_idx, row in features_df.iterrows():
+        record = {
+            "regime_label":      row["regime_label_smoothed"],
+            "prior_regime":      row["prior_regime"],
+            "regime_shift_date": str(pd.Timestamp(row["regime_shift_date"]).date()),
+            "regime_confidence": round(float(row["regime_confidence"]), 3),
+            "regime_volatility": round(float(row["regime_volatility"]), 4),
+            "yield_curve":       round(float(row["yield_curve"]), 4),
+            "term_spread":       round(float(row["term_spread"]), 4),
+            "fed_funds":         round(float(row["fed_funds"]), 4),
+            "unemployment":      round(float(row["unemployment"]), 4),
+            "cpi":               round(float(row["cpi"]), 4),
+            "credit_spread":     round(float(row["credit_spread"]), 4),
+            "vix":               round(float(row["vix"]), 4),
+            "indpro":            round(float(row["indpro"]), 4),
+        }
+        try:
+            RegimeRecord(**record)
+            regime_sequence[str(date_idx.date())] = record
+            passed += 1
+        except Exception as e:
+            print(f"  VALIDATION FAILED [{date_idx.date()}]: {e}")
+            failed += 1
 
-    return to_macro_regime_snapshot(regime_sequence, as_of=as_of)
+    print(f"Validation complete — Passed: {passed} | Failed: {failed}")
+    return regime_sequence
+
+
+def build_snapshot(features_df: pd.DataFrame) -> MacroRegimeSnapshot:
+    """
+    Build the most-recent-month MacroRegimeSnapshot (contracts.py) for the
+    orchestrator. is_low_confidence and regime_change_detected are derived by
+    the contract's validator.
+    """
+    last_date = features_df.index[-1]
+    row = features_df.loc[last_date]
+
+    return MacroRegimeSnapshot(
+        as_of             = pd.Timestamp(last_date).date(),
+        regime_label      = row["regime_label_smoothed"],
+        prior_regime      = row["prior_regime"],
+        regime_shift_date = pd.Timestamp(row["regime_shift_date"]).date(),
+        regime_confidence = round(float(row["regime_confidence"]), 3),
+        regime_volatility = round(float(row["regime_volatility"]), 4),
+        yield_curve       = round(float(row["yield_curve"]), 4),
+        term_spread       = round(float(row["term_spread"]), 4),
+        fed_funds         = round(float(row["fed_funds"]), 4),
+        unemployment      = round(float(row["unemployment"]), 4),
+        cpi               = round(float(row["cpi"]), 4),
+        credit_spread     = round(float(row["credit_spread"]), 4),
+    )

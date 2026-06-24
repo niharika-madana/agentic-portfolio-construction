@@ -1,12 +1,15 @@
 # Research Agent — Design Document
 **AI Financial Advisor Pipeline | Agent 2 of 5**
-*khive AI LLC | Fordham MSQF Capstone 2026*
+*Fordham MSQF Capstone 2026*
+*Last updated: 2026-06-25 (June 25 session — FRED and CRSP data migrated to Parquet cache; MacroRegimeSnapshot contract added; is_low_confidence and regime_change_detected derived fields implemented)*
 
 ---
 
 ## Objective
 
-Produce a **structured research report** — a validated macro regime classification passed downstream to the Allocation Agent. The Research Agent does not generate investment recommendations. It identifies which macro state the economy is currently in, so the Allocation Agent can anchor portfolio construction to historically grounded return and risk expectations.
+Produce a **structured research report** — a validated `MacroRegimeSnapshot` passed downstream to the Allocation and Risk agents. The Research Agent does not generate investment recommendations. It identifies which macro state the economy is currently in, so the Allocation Agent can anchor portfolio construction to historically grounded return and risk expectations.
+
+**Implementation status:** ✅ Fully implemented — entry point `agents/research/research_agent.py → run_research_agent()`.
 
 ---
 
@@ -20,7 +23,11 @@ Profile Agent → Research Agent → Allocation Agent → Risk Agent → Complia
 
 **Input:** nothing from the Profile Agent directly — the Research Agent runs independently on FRED macro data.
 
-**Output:** `agents/research/regime_sequence.json` — a date-keyed JSON of validated regime classifications, consumed by the Allocation Agent as its macro anchor.
+**Output:** A single `MacroRegimeSnapshot` (Pydantic-validated) consumed by the Allocation and Risk agents. Also writes:
+- `agents/research/fred_macro_regimes.csv` — full feature matrix for inspection
+- `agents/research/regime_sequence.json` — date-keyed validated regime sequence
+- `agents/research/macro_regime_snapshot.json` — most recent month snapshot
+- `data/storage/fred_macro_regimes.parquet` — compressed feature matrix for downstream agents
 
 > *Ocean (June 11 meeting): "The research agent follows the persona/profile report. Its sole deliverable is a research report, which then becomes the input for the allocation–proposal–risk loop."*
 
@@ -29,7 +36,7 @@ Profile Agent → Research Agent → Allocation Agent → Risk Agent → Complia
 ## Pipeline
 
 ```
-Pull 13 FRED macro series
+data/storage/fred_macro.parquet   ← read (fetched by FRED API on first run, cached thereafter)
     ↓
 Feature engineering (z-scores, log-transforms, first differences, YoY changes)
     ↓
@@ -41,9 +48,11 @@ XGBoost regime mapping (anchor windows → academic taxonomy labels)
     ↓
 6-month rolling majority vote (regime smoothing)
     ↓
-Pydantic validation (RegimeRecord schema) — rejects malformed rows
+[June 22] HMM & GMM comparison — benchmarked against XGBoost, current pipeline retained
     ↓
-Export: CSV (full feature matrix) + JSON (regime sequence for downstream)
+Pydantic validation (RegimeRecord — full sequence; MacroRegimeSnapshot — most recent month)
+    ↓
+Export: CSV + JSON (regime sequence) + Parquet (feature matrix) + MacroRegimeSnapshot JSON
 ```
 
 ---
@@ -209,8 +218,68 @@ Ad-hoc event labels (Dot-com, COVID, AI Boom) replaced with macro-state definiti
 
 ---
 
+## Model Comparison — HMM & GMM vs. XGBoost
+
+*Added June 22 session. Meeting action item: explore HMM and GMM as alternatives or produce a data-driven justification for retaining the current pipeline.*
+
+### Models Evaluated
+
+**Gaussian HMM** (`hmmlearn`, diagonal covariance, n_components=5, n_iter=1000, random_state=42) — a probabilistic state-space model that encodes regime persistence via a Markov transition matrix. Diagonal covariance used because full covariance requires estimating 13×13 = 169 parameters per state, infeasible with ~270 observations.
+
+**Gaussian Mixture Model** (`sklearn`, full covariance, n_components=5, n_init=10, random_state=42) — an unsupervised density estimator that models the joint distribution of macro features as a mixture of 5 Gaussians. No temporal structure — classifies each month independently.
+
+Both models were run on the same 13 `signal_cols` feature set. Cluster IDs were mapped to academic regime labels by majority-overlap against the smoothed XGBoost labels on the anchor windows.
+
+### Quantitative Results
+
+| Metric | XGBoost (smoothed) | HMM | GMM |
+|---|---|---|---|
+| Distinct regimes recovered | **5 / 5** | 3 / 5 | 3 / 5 |
+| Match rate vs. XGBoost | — | 66.8% | 48.2% |
+| Avg regime duration (months) | **15.2** | 16.1 | 12.5 |
+| Regimes missing | none | Early Recovery, Inflation Shock | Early Recovery, Moderate Expansion |
+
+### CRSP Return Validation — All Three Models
+
+| Regime | XGBoost Avg Return | HMM Avg Return | GMM Avg Return | Expected |
+|---|---|---|---|---|
+| Early Recovery | **+1.54%** | — | — | Positive |
+| Late-Cycle Expansion | **+1.29%** | +0.85% | +1.40% | Positive |
+| Moderate Expansion | **+1.05%** | +1.19% | — | Positive |
+| Financial Crisis & ZLB | +0.76% | +0.89% | +1.00% | Negative / high vol |
+| Inflation Shock | **−0.29%** | — | +0.19% | Negative |
+
+### Key Findings
+
+**HMM (match rate 66.8%, 3/5 regimes recovered):**
+- Fails to recover `Early Recovery` and `Inflation Shock` — the two regimes most critical for portfolio differentiation
+- Two clusters both map to `Financial Crisis & ZLB` (cluster collision); cluster 3 contains only 1 month (degenerate solution)
+- Missing `Inflation Shock` is the most damaging failure — HMM absorbs those months into `Late-Cycle Expansion` (+0.85%), masking the negative-return signal of the 2022–2023 tightening cycle
+- Avg duration of 16.1 months is marginally higher than XGBoost's 15.2 — the Markov transition matrix adds modest persistence but not meaningfully more than the 6-month majority vote already achieves
+
+**GMM (match rate 48.2%, 3/5 regimes recovered):**
+- Lowest match rate of all three models; three of five clusters collapse into `Financial Crisis & ZLB`
+- Without temporal structure, GMM over-fits to the largest cluster and absorbs structurally distinct periods into the same label
+- `Inflation Shock` partially recovered but shown as +0.19% avg return vs. XGBoost's correct −0.29% — understates drawdown risk
+- Avg duration of 12.5 months is the lowest of all three models — more regime churn than XGBoost with no mechanism to prevent it
+
+### Verdict: Retain K-means + XGBoost Pipeline
+
+The comparison provides a clear, data-driven justification for keeping the current approach:
+
+1. **Taxonomy completeness:** XGBoost recovers all 5 academic regimes. HMM and GMM recover only 3, losing the two regimes most critical for portfolio differentiation.
+2. **Inflation Shock identification:** XGBoost is the only model that correctly flags the 2022–2023 tightening cycle as a negative-return environment (−0.29%). This is load-bearing for the Allocation Agent.
+3. **Match rate:** HMM achieves 66.8%, GMM only 48.2%. Neither clears a threshold that would justify replacing the existing pipeline.
+4. **Regime churn:** GMM's avg duration of 12.5 months is lower than XGBoost's 15.2, producing more rebalancing noise downstream.
+5. **Interpretability:** XGBoost anchor windows are tied to historically unambiguous periods — every label is defensible in the oral defense. HMM and GMM cluster IDs have no inherent economic meaning and require post-hoc mapping that itself introduces ambiguity.
+
+**HMM as a future extension:** The one capability HMM adds that XGBoost lacks is a transition probability matrix — a forward-looking probability of moving from the current regime to each of the others. This could be added as a supplementary field in `MacroRegimeSnapshot` without replacing the XGBoost classifier. Flagged as a Phase 2 enhancement for the paper's Future Work section.
+
+---
+
 ## Pydantic Validation
 
+### RegimeRecord — Per-Row Validation
 Every row is validated against `RegimeRecord` before writing to disk. No row with an invalid regime label, out-of-range confidence score, or negative volatility can enter the output JSON.
 
 ```python
@@ -230,11 +299,35 @@ class RegimeRecord(BaseModel):
     indpro:            float
 ```
 
+### MacroRegimeSnapshot — Downstream Contract
+Single validated Pydantic object for the most recent month, passed directly to the orchestrator and consumed by the Allocation and Risk agents. Two derived boolean fields are enforced by `model_validator`:
+
+```python
+class MacroRegimeSnapshot(BaseModel):
+    as_of:                  date
+    regime_label:           str
+    prior_regime:           str
+    regime_shift_date:      date
+    regime_confidence:      float = Field(ge=0.0, le=1.0)
+    regime_volatility:      float = Field(ge=0.0)
+    yield_curve:            float
+    term_spread:            float
+    fed_funds:              float
+    unemployment:           float
+    cpi:                    float
+    credit_spread:          float
+    is_low_confidence:      bool   # derived: confidence < 0.60
+    regime_change_detected: bool   # derived: regime_label ≠ prior_regime
+```
+
 > *Ocean (June 11 meeting): "The research agent's output must be validated because LLM-generated numbers can be fabricated; proper validation via Pydantic models is needed before feeding the research report downstream."*
 
 ---
 
-## Output Schema (JSON)
+## Output Schema
+
+### regime_sequence.json — Full Sequence
+Date-keyed JSON of all validated monthly regime records:
 
 ```json
 {
@@ -253,6 +346,28 @@ class RegimeRecord(BaseModel):
     "vix":               14.95,
     "indpro":            1.23
   }
+}
+```
+
+### macro_regime_snapshot.json — Most Recent Month
+Single `MacroRegimeSnapshot` object passed to the orchestrator:
+
+```json
+{
+  "as_of":                 "2025-12-01",
+  "regime_label":          "Late-Cycle Expansion",
+  "prior_regime":          "Late-Cycle Expansion",
+  "regime_shift_date":     "2024-01-01",
+  "regime_confidence":     0.847,
+  "regime_volatility":     0.0312,
+  "yield_curve":           0.71,
+  "term_spread":           0.43,
+  "fed_funds":             3.72,
+  "unemployment":          4.1,
+  "cpi":                   2.653,
+  "credit_spread":         1.84,
+  "is_low_confidence":     false,
+  "regime_change_detected": false
 }
 ```
 
@@ -281,17 +396,20 @@ Four of five regimes validate directionally. Financial Crisis & ZLB validates on
 **Allocation Agent** consumes:
 - `regime_label` — anchors portfolio weight construction to academic regime state
 - `regime_confidence` — weights the regime signal (low confidence → more conservative positioning)
-- `regime_shift_date` — detects fresh regime transitions that warrant rebalancing
-- `prior_regime` — identifies transitions (e.g. Inflation Shock → Late-Cycle triggers risk-on shift)
+- `is_low_confidence` — triggers conservative blending toward equal-weight prior if True (confidence < 0.60)
+- `regime_shift_date` + `regime_change_detected` — fresh transitions warrant rebalancing
+- `prior_regime` — identifies transition direction (e.g. Inflation Shock → Late-Cycle = risk-on shift)
 
 **Risk Agent** consumes:
-- `regime_volatility` — macro stress proxy; elevates VaR threshold in high-volatility regimes
 - `regime_label` — maps to historical drawdown distributions per regime for stress testing
+- `regime_volatility` — macro stress proxy; elevates VaR threshold in high-volatility regimes
 - `vix` — equity fear gauge for tail-risk scenario construction
+- `is_low_confidence` — elevates stress test stringency when regime classification is uncertain
 
 **Compliance Agent** consumes:
 - `regime_label` — regime-conditional suitability checks (e.g. Financial Crisis & ZLB triggers conservative allocation constraints)
 - `cpi` — inflation threshold check for real-return mandate compliance
+- `regime_change_detected` — Check 1.3 requires current regime label in regime_evaluation
 
 ---
 
@@ -323,26 +441,31 @@ CRSP value-weighted returns are only available through December 2024. The 12 mos
 **Mitigation:** The validation join drops NaN rows silently. Documented in 10a. Not correctable until CRSP releases 2025 data.
 
 ### Failure Mode 6 — FRED API Failure
-Live FRED pull fails at runtime (API key expired, network timeout, series discontinued).
+FRED is unreachable or the API key is invalid.
 
-**Mitigation:** Each series is fetched independently in a loop — a single series failure does not block others. `dropna()` after merging removes incomplete rows. For production, add per-series try/except with fallback to cached CSV.
+**Mitigation:** `data/storage/fred_macro.parquet` is checked first on every run — no API call is made if the parquet cache exists. If the parquet is missing and the API key is unavailable, a `FileNotFoundError` is raised with clear instructions. On first run, each series is fetched independently in a loop so a single series failure does not block others.
 
 ---
 
 ## Implementation Notes
 
 - Runs in **Google Colab** with API keys stored via `userdata.get()`
-- FRED API key stored as secret `FRED_API`
-- Output files saved to `agents/research/`:
-  - `fred_macro_regimes.csv` — full feature matrix with smoothed regime labels
-  - `regime_sequence.json` — validated regime sequence passed downstream
-- CRSP validation requires `crsp_market_index.csv` in the working directory
-- Notebooks are prototypes — final agents to be refactored into `.py` modules before Thursday
+- FRED API key stored as secret `FRED_API` — only needed on first run
+- No API keys needed after `data/storage/fred_macro.parquet` exists
+- Dependencies: `fredapi`, `xgboost`, `scikit-learn`, `matplotlib`, `ruptures`, `pydantic`, `scipy`, `hmmlearn`, `pyarrow`
+- Output files:
+  - `agents/research/fred_macro_regimes.csv` — full feature matrix with smoothed regime labels
+  - `agents/research/regime_sequence.json` — validated regime sequence passed downstream
+  - `agents/research/macro_regime_snapshot.json` — most recent month `MacroRegimeSnapshot`
+  - `data/storage/fred_macro.parquet` — cached FRED macro data (fetched once)
+  - `data/storage/crsp_market_index.parquet` — cached CRSP returns (converted from CSV once)
+  - `data/storage/fred_macro_regimes.parquet` — full feature matrix for downstream agents
 
 ---
 
 ## Open Questions
 
+- [x] ~~Explore HMM and GMM as alternative regime detection models~~ — resolved June 22: both models evaluated on same 13-feature set. XGBoost retained — only model to recover all 5 academic regimes and correctly identify Inflation Shock as negative-return. HMM flagged as Phase 2 extension for transition probability matrix.
 - [ ] Confirm whether to add `ewretd` (equal-weighted CRSP) alongside `vwretd` for validation — equal-weighted returns are more sensitive to small-cap regimes
 - [ ] Evaluate whether reducing `pen` in PELT (e.g. pen=5) recovers the 2001 dot-com breakpoint without re-introducing noise breaks
 - [ ] Decide whether to hard-gate on `regime_confidence` threshold before passing to Allocation Agent (e.g. only act on regime if confidence > 0.70)

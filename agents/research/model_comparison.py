@@ -1,104 +1,35 @@
 """
-model_comparison.py — Research Agent
-======================================
-HMM and GMM alternative model comparison against XGBoost.
-Produces match rates, regime duration stats, and CRSP return validation.
+model_comparison.py — HMM & GMM benchmarking vs. the XGBoost pipeline.
 
-June 22 verdict: retain K-means + XGBoost pipeline.
-See 22JUN_ResearchAgent_Design.md — Model Comparison section.
+Added in the June 22 session to satisfy the meeting action item: explore HMM and
+GMM as alternatives or produce a data-driven justification for retaining the
+current pipeline. The verdict (documented in the design doc) is to retain
+K-means + XGBoost — it is the only model that recovers all five academic regimes
+and correctly flags Inflation Shock as a negative-return environment.
 
-Exports:
-  - fit_hmm_gmm()
-  - map_clusters_to_regimes()
-  - compute_comparison_metrics()
-  - avg_regime_duration()
-  - crsp_summary()
-  - run_model_comparison()
+This module is optional: it is invoked by run_research_agent(..., compare_models=True)
+and never on the critical path that produces the MacroRegimeSnapshot.
 """
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from hmmlearn.hmm import GaussianHMM
-from sklearn.mixture import GaussianMixture
-
-from .features import SIGNAL_COLS
 
 
-# ---------------------------------------------------------------------------
-# Model fitting
-# ---------------------------------------------------------------------------
-
-def fit_hmm_gmm(features_df, n_components=5):
-    """
-    Fit Gaussian HMM (diagonal covariance) and GMM (full covariance)
-    on the same 13 signal_cols feature set.
-
-    Diagonal covariance for HMM: full covariance requires 13×13=169
-    parameters per state, infeasible with ~270 observations.
-
-    Returns:
-        hmm_model, gmm_model, hmm_raw_labels, gmm_raw_labels,
-        hmm_proba, gmm_proba
-    """
-    X_full = features_df[SIGNAL_COLS].values
-
-    hmm_model = GaussianHMM(
-        n_components=n_components,
-        covariance_type="diag",
-        n_iter=1000,
-        random_state=42,
-    )
-    hmm_model.fit(X_full)
-    hmm_raw_labels = hmm_model.predict(X_full)
-    hmm_proba      = hmm_model.predict_proba(X_full)
-
-    print(f"HMM converged: {hmm_model.monitor_.converged}")
-    print(f"HMM raw label distribution:\n{pd.Series(hmm_raw_labels).value_counts().sort_index()}")
-
-    gmm_model = GaussianMixture(
-        n_components=n_components,
-        covariance_type="full",
-        n_init=10,
-        random_state=42,
-    )
-    gmm_model.fit(X_full)
-    gmm_raw_labels = gmm_model.predict(X_full)
-    gmm_proba      = gmm_model.predict_proba(X_full)
-
-    print(f"\nGMM converged: {gmm_model.converged_}")
-    print(f"GMM raw label distribution:\n{pd.Series(gmm_raw_labels).value_counts().sort_index()}")
-
-    return hmm_model, gmm_model, hmm_raw_labels, gmm_raw_labels, hmm_proba, gmm_proba
-
-
-# ---------------------------------------------------------------------------
-# Cluster → academic label mapping
-# ---------------------------------------------------------------------------
-
-def map_clusters_to_regimes(raw_labels, reference_labels):
-    """
-    For each unsupervised cluster ID, find the academic regime label
-    with the highest overlap against the smoothed XGBoost labels.
-
-    Returns:
-        dict — {cluster_id: academic_label}
-    """
+def _map_clusters_to_regimes(raw_labels, reference_labels) -> dict:
+    """Map unsupervised cluster ids to academic labels by max overlap with the
+    smoothed XGBoost reference labels."""
     mapping = {}
     for cluster_id in sorted(set(raw_labels)):
-        mask        = raw_labels == cluster_id
-        most_common = pd.Series(reference_labels[mask]).value_counts().idxmax()
-        mapping[cluster_id] = most_common
+        mask = raw_labels == cluster_id
+        mapping[cluster_id] = pd.Series(reference_labels[mask]).value_counts().idxmax()
     return mapping
 
 
-# ---------------------------------------------------------------------------
-# Comparison metrics
-# ---------------------------------------------------------------------------
-
-def avg_regime_duration(labels):
-    """Average number of consecutive months per regime label."""
-    durations = []
-    count = 1
+def _avg_regime_duration(labels) -> float:
+    """Average consecutive-month run length (regime persistence)."""
+    durations, count = [], 1
     for i in range(1, len(labels)):
         if labels[i] == labels[i - 1]:
             count += 1
@@ -106,102 +37,65 @@ def avg_regime_duration(labels):
             durations.append(count)
             count = 1
     durations.append(count)
-    return round(np.mean(durations), 1)
+    return round(float(np.mean(durations)), 1)
 
 
-def compute_comparison_metrics(features_df):
+def compare_models(features_df: pd.DataFrame, signal_cols: list[str]) -> dict:
     """
-    Compute and print the full model comparison:
-        - Match rate vs smoothed XGBoost labels
-        - Average regime duration (persistence)
-        - Distinct regimes recovered (out of 5)
+    Fit a Gaussian HMM and a Gaussian Mixture Model on the same signal matrix,
+    map their clusters to the academic taxonomy via overlap with the smoothed
+    XGBoost labels, and return a comparison summary.
 
-    Requires features_df to have hmm_label and gmm_label columns.
+    Requires regime_label_smoothed to already be present on features_df. Adds
+    hmm_label / gmm_label (+ confidences) columns and returns a dict of metrics.
     """
-    xgb_arr = features_df["regime_label_smoothed"].values
-    hmm_arr = features_df["hmm_label"].values
-    gmm_arr = features_df["gmm_label"].values
+    from hmmlearn.hmm import GaussianHMM
+    from sklearn.mixture import GaussianMixture
 
-    hmm_match = (hmm_arr == xgb_arr).mean()
-    gmm_match = (gmm_arr == xgb_arr).mean()
+    if "regime_label_smoothed" not in features_df.columns:
+        raise ValueError("compare_models requires smoothed XGBoost labels first.")
 
-    print("=== Match Rate vs Smoothed XGBoost Labels ===")
-    print(f"  HMM match rate: {hmm_match:.1%}")
-    print(f"  GMM match rate: {gmm_match:.1%}")
-
-    print("\n=== Average Regime Duration (months) ===")
-    print(f"  XGBoost (smoothed): {avg_regime_duration(xgb_arr)}")
-    print(f"  HMM:                {avg_regime_duration(hmm_arr)}")
-    print(f"  GMM:                {avg_regime_duration(gmm_arr)}")
-
-    print("\n=== Distinct Regime Labels Recovered (out of 5) ===")
-    print(f"  XGBoost: {features_df['regime_label_smoothed'].nunique()}")
-    print(f"  HMM:     {features_df['hmm_label'].nunique()}")
-    print(f"  GMM:     {features_df['gmm_label'].nunique()}")
-
-
-# ---------------------------------------------------------------------------
-# CRSP return validation
-# ---------------------------------------------------------------------------
-
-def crsp_summary(features_df, label_col, model_name, crsp_path="crsp_market_index.csv"):
-    """
-    Compute average monthly return and volatility per regime label
-    against the CRSP value-weighted market index.
-    """
-    crsp = pd.read_csv(crsp_path, parse_dates=["date"])
-    crsp = crsp.set_index("date")
-    crsp.index = crsp.index.to_period("M").to_timestamp("s")
-
-    df = features_df[[label_col]].join(crsp[["vwretd"]], how="left")
-    summary = (
-        df.groupby(label_col)["vwretd"]
-        .agg(["mean", "std", "count"])
-        .rename(columns={"mean": "Avg Return", "std": "Std Dev", "count": "Months"})
-    )
-    summary["Avg Return"] = (summary["Avg Return"] * 100).round(2)
-    summary["Std Dev"]    = (summary["Std Dev"] * 100).round(2)
-    summary.index.name    = "Regime"
-
-    print(f"\n=== CRSP Validation — {model_name} ===")
-    print(summary.to_string())
-    return summary
-
-
-def run_model_comparison(features_df, crsp_path="crsp_market_index.csv"):
-    """
-    Full model comparison pipeline:
-        1. Fit HMM and GMM
-        2. Map clusters to academic labels
-        3. Attach labels to features_df
-        4. Compute match rates, durations, distinct regimes
-        5. CRSP return validation for all three models
-
-    Returns:
-        features_df (pd.DataFrame) — with hmm_label, gmm_label columns added
-    """
+    X_full = features_df[signal_cols].values
     xgb_smoothed = features_df["regime_label_smoothed"].values
 
-    _, _, hmm_raw, gmm_raw, hmm_proba, gmm_proba = fit_hmm_gmm(features_df)
+    hmm = GaussianHMM(n_components=5, covariance_type="diag", n_iter=1000, random_state=42)
+    hmm.fit(X_full)
+    hmm_raw = hmm.predict(X_full)
+    hmm_proba = hmm.predict_proba(X_full)
 
-    hmm_mapping = map_clusters_to_regimes(hmm_raw, xgb_smoothed)
-    gmm_mapping = map_clusters_to_regimes(gmm_raw, xgb_smoothed)
+    gmm = GaussianMixture(n_components=5, covariance_type="full", n_init=10, random_state=42)
+    gmm.fit(X_full)
+    gmm_raw = gmm.predict(X_full)
+    gmm_proba = gmm.predict_proba(X_full)
 
-    print(f"\nHMM cluster → regime mapping: {hmm_mapping}")
-    print(f"GMM cluster → regime mapping: {gmm_mapping}")
+    hmm_map = _map_clusters_to_regimes(hmm_raw, xgb_smoothed)
+    gmm_map = _map_clusters_to_regimes(gmm_raw, xgb_smoothed)
 
-    features_df["hmm_label"]      = pd.Series(hmm_raw, index=features_df.index).map(hmm_mapping)
-    features_df["gmm_label"]      = pd.Series(gmm_raw, index=features_df.index).map(gmm_mapping)
+    features_df["hmm_label"] = pd.Series(hmm_raw, index=features_df.index).map(hmm_map)
+    features_df["gmm_label"] = pd.Series(gmm_raw, index=features_df.index).map(gmm_map)
     features_df["hmm_confidence"] = hmm_proba.max(axis=1).round(3)
     features_df["gmm_confidence"] = gmm_proba.max(axis=1).round(3)
 
-    print(f"\nHMM label distribution:\n{features_df['hmm_label'].value_counts()}")
-    print(f"\nGMM label distribution:\n{features_df['gmm_label'].value_counts()}")
+    hmm_arr = features_df["hmm_label"].values
+    gmm_arr = features_df["gmm_label"].values
 
-    compute_comparison_metrics(features_df)
+    summary = {
+        "xgb_distinct_regimes": int(features_df["regime_label_smoothed"].nunique()),
+        "hmm_distinct_regimes": int(features_df["hmm_label"].nunique()),
+        "gmm_distinct_regimes": int(features_df["gmm_label"].nunique()),
+        "hmm_match_rate": float((hmm_arr == xgb_smoothed).mean()),
+        "gmm_match_rate": float((gmm_arr == xgb_smoothed).mean()),
+        "xgb_avg_duration": _avg_regime_duration(xgb_smoothed),
+        "hmm_avg_duration": _avg_regime_duration(hmm_arr),
+        "gmm_avg_duration": _avg_regime_duration(gmm_arr),
+        "verdict": "retain K-means + XGBoost",
+    }
 
-    crsp_summary(features_df, "regime_label_smoothed", "XGBoost (smoothed)", crsp_path)
-    crsp_summary(features_df, "hmm_label",             "HMM",                crsp_path)
-    crsp_summary(features_df, "gmm_label",             "GMM",                crsp_path)
-
-    return features_df
+    print("=== Model Comparison vs Smoothed XGBoost ===")
+    print(f"  Distinct regimes — XGB: {summary['xgb_distinct_regimes']}/5 | "
+          f"HMM: {summary['hmm_distinct_regimes']}/5 | GMM: {summary['gmm_distinct_regimes']}/5")
+    print(f"  Match rate       — HMM: {summary['hmm_match_rate']:.1%} | "
+          f"GMM: {summary['gmm_match_rate']:.1%}")
+    print(f"  Avg duration (mo)— XGB: {summary['xgb_avg_duration']} | "
+          f"HMM: {summary['hmm_avg_duration']} | GMM: {summary['gmm_avg_duration']}")
+    return summary
