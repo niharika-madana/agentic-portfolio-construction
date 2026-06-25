@@ -27,7 +27,13 @@ from contracts import (
     Severity,
 )
 
-_REQUIRED_REGIMES = {"dot_com", "gfc", "covid", "rate_hike", "ai_boom"}
+_REQUIRED_REGIMES = {
+    "Early Recovery",
+    "Late-Cycle Expansion",
+    "Financial Crisis & ZLB",
+    "Moderate Expansion",
+    "Inflation Shock",
+}
 _REQUIRED_DERIVATION_FIELDS = {
     "drawdown_method", "concentration_method", "sector_method",
     "hc_type", "rsu_concentration", "data_source",
@@ -219,7 +225,7 @@ def check_consistency(
 
     # ── 1.2c: Regime evaluation pass/fail flags ───────────────────────
     for regime, ev in risk_output.regime_evaluation.items():
-        dd_exceeds_floor = ev.portfolio_drawdown < ev.drawdown_floor  # both negative, so < means worse
+        dd_exceeds_floor = ev.portfolio_drawdown > ev.drawdown_floor  # positive fractions; larger = more loss = worse
 
         if dd_exceeds_floor and ev.passed:
             violations.append(ComplianceViolation(

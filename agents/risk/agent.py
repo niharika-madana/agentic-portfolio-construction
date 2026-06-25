@@ -92,17 +92,25 @@ def _build_reasoning_prompt(
         RiskDecision.REJECT:  "REJECT — portfolio cannot be made compliant",
     }
 
+    regime_note = {
+        "normal":   "NORMAL — standard drawdown caps apply",
+        "elevated": "ELEVATED — caps widened 25% to prevent procyclical selling",
+        "crisis":   "CRISIS — caps widened 50% (2008/COVID-scale vol detected)",
+    }.get(rm.market_regime.value, rm.market_regime.value)
+
     lines = [
         "You are a risk officer writing a compliance reasoning trace for an internal audit log.",
         "",
         "RISK METRICS",
-        f"  Volatility:       {rm.volatility:.2%}  (annualized)",
-        f"  VaR 95%:          {vc.var_95:.2%}  daily",
-        f"  CVaR 95%:         {vc.cvar_95:.2%}  daily",
-        f"  VaR 99%:          {vc.var_99:.2%}  daily",
-        f"  CVaR 99%:         {vc.cvar_99:.2%}  daily",
-        f"  Max drawdown:     {rm.max_drawdown:.2%}",
-        f"  Liquidity score:  {rm.liquidity_score:.2f}",
+        f"  Volatility:          {rm.volatility:.2%}  (annualized)",
+        f"  VaR 95%:             {vc.var_95:.2%}  daily",
+        f"  CVaR 95%:            {vc.cvar_95:.2%}  daily",
+        f"  VaR 99%:             {vc.var_99:.2%}  daily",
+        f"  CVaR 99%:            {vc.cvar_99:.2%}  daily",
+        f"  Max drawdown:        {rm.max_drawdown:.2%}",
+        f"  Liquidity score:     {rm.liquidity_score:.2f}",
+        f"  Market regime:       {regime_note}",
+        f"  Effective DD cap:    {rm.effective_drawdown_cap:.2%}  (regime-adjusted)",
         "",
         "HUMAN CAPITAL ADJUSTED",
         f"  Total wealth:              ${hca.total_wealth:>12,.0f}",
@@ -277,6 +285,7 @@ def risk_output_to_agent_output(
     if risk_output.flag_iteration > 0:
         warnings.append(f"Portfolio required {risk_output.flag_iteration} FLAG revision(s)")
 
+    rm = risk_output.risk_metrics
     return RiskAgentOutput(
         risk_decision              = RiskDecision(risk_output.decision.value),
         regime_evaluation          = regime_eval,
@@ -285,7 +294,9 @@ def risk_output_to_agent_output(
         violations                 = violations,
         derivation                 = derivation,
         warnings                   = warnings,
-        portfolio_volatility_annual= risk_output.risk_metrics.volatility,
+        market_regime              = rm.market_regime,
+        effective_drawdown_cap     = rm.effective_drawdown_cap,
+        portfolio_volatility_annual= rm.volatility,
     )
 
 
@@ -321,7 +332,8 @@ def run_risk_agent(
             f"[No API key — template trace] "
             f"Decision: {raw_risk.decision.value}. "
             f"Vol {rm.volatility:.2%}, VaR95 {rm.var_cvar.var_95:.2%}, "
-            f"max drawdown {rm.max_drawdown:.2%}. "
+            f"max drawdown {rm.max_drawdown:.2%} vs {rm.effective_drawdown_cap:.2%} cap "
+            f"({rm.market_regime.value} regime). "
             f"HC fraction {rm.hc_adjusted.hc_fraction:.1%}, "
             f"employer concentration {rm.hc_adjusted.employer_concentration:.1%}. "
             f"Violations: {len(raw_risk.constraints_violated)}."

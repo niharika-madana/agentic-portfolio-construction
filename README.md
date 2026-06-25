@@ -8,20 +8,20 @@ A multi-agent AI system that constructs personalized investment portfolios groun
 
 The system runs five specialized agents in sequence to produce a compliance-cleared, client-specific portfolio recommendation. Each agent has a defined Pydantic contract in `contracts.py`; no agent invents a number — every quantitative output is produced by deterministic code and cited in the rationale text.
 
-**Core idea:** A client's total wealth = Financial Capital + Human Capital (PV of future earnings). The portfolio's equity allocation must account for how much equity risk the client is already carrying implicitly through their career. A software developer with RSUs and a salary correlated to the S&P 500 needs a very different portfolio than a tenured biology professor.
+**Core idea:** A client's total wealth = Financial Capital + Human Capital (PV of future earnings). The portfolio's equity allocation must account for how much equity risk the client already carries implicitly through their career. A software developer with RSUs and a salary correlated to the S&P 500 needs a very different portfolio than a tenured biology professor.
 
 ---
 
-## Agent Implementation Status
+## Agent Status
 
 | Agent | Status | Entry Point |
 |-------|--------|-------------|
 | Profile Agent | ✅ Implemented | `agents/profile/profile_agent.py → run_profile_agent()` |
 | Research Agent | ✅ Implemented | `agents/research/research_agent.py → run_research_agent()` |
+| Allocation Agent | ✅ Implemented | `agents/allocation/agent.py → run_allocation_agent()` |
+| Risk Agent | ✅ Implemented | `agents/risk/agent.py → run_risk_agent()` |
 | Compliance Agent | ✅ Implemented | `agents/compliance/compliance_agent.py → run_compliance()` |
-| Allocation Agent | 🔲 Stub | `orchestrator.py` — raises `NotImplementedError` |
-| Risk Agent | 🔲 Stub | `orchestrator.py` — raises `NotImplementedError` |
-| Orchestrator | ⚠️ Partial | `orchestrator.py → run_pipeline()` — wired; awaits Allocation + Risk |
+| Orchestrator | ✅ Implemented | `agents/orchestrator/orchestrator.py → run_pipeline() / run_all()` |
 
 ---
 
@@ -41,28 +41,27 @@ The system runs five specialized agents in sequence to produce a compliance-clea
          ┌──────────────────────┐
          │   Allocation Agent   │◄──────────────────────────┐
          │                      │                           │
-         │  BL optimisation     │◄── Risk feedback          │
-         │  equity_target drives│     (violations, ≤3 rev.) │
+         │  Black-Litterman BL  │◄── Risk FLAG feedback     │
+         │  equity_target drives│     violations, ≤3 rev.   │
          │  portfolio weights   │                           │
          └──────────┬───────────┘                           │
-                    │ AllocationAgentOutput                 │
-                    ▼                                       │
-         ┌──────────────────────┐                          │
-         │     Risk Agent       │──── FLAG ────────────────┘
+                    │ AllocationOutput / AllocationAgentOutput│
+                    ▼                                        │
+         ┌──────────────────────┐                           │
+         │     Risk Agent       │──── FLAG ─────────────────┘
          │                      │
+         │  VaR 95/99, CVaR     │
          │  Regime stress tests │
-         │  Position/sector lim.│
          │  HC-corr. adj. limits│
          └──────────┬───────────┘
-                    │ RiskAgentOutput
+                    │ RiskAgentOutput   APPROVE / FLAG / REJECT
                     ▼
          ┌──────────────────────┐     ┌──────────────────────────┐
          │  Orchestrator        │────►│   Compliance Agent       │
          │  (assemble input)    │     │                          │
          └──────────────────────┘     │  Job 1: Audit Risk Agent │
                     ▲                 │  Job 2: Fiduciary checks │
-                    │                 └──────────┬───────────────┘
-                    │ FAIL (≤2 rev.)             │
+                    │ FAIL (≤2 rev.)  └──────────┬───────────────┘
                     └────────────────────────────┘
                                        │ PASS / PASS_WITH_WARNINGS
                                        ▼
@@ -81,7 +80,7 @@ The system runs five specialized agents in sequence to produce a compliance-clea
 HC = Annual Salary × [1 − (1 + r)^(−n)] / r
 ```
 
-- `r` = FRED DGS10 (10Y Treasury yield, cached in `data/storage/fred_dgs10.parquet`)
+- `r` = FRED DGS10 (live 10Y Treasury yield; 4.4% fallback if no API key)
 - `n` = years to retirement (= 65 − age)
 
 ### Income Risk Parameters
@@ -110,15 +109,15 @@ This target is what makes each persona's allocation fundamentally different, and
 
 ### Step 1 — Profile Agent → `ProfileAgentOutput`
 
-Generates one validated profile per BLS occupation at median salary (or p25/p75 with `include_percentile_variants=True`).
+Generates one validated profile per BLS occupation at median salary (p50).
 
 **Data sources:**
 - BLS OES May 2023 national file → salary percentiles by SOC code → `data/storage/bls_oes.parquet`
 - SCF 2022 Table 6 → median investable financial assets by age × income quartile (static dict)
-- FRED DGS10 → annuity discount rate → `data/storage/fred_dgs10.parquet`
-- Calibrated β/ρ table (Ibbotson 2007, Davis & Willen 2000)
+- FRED DGS10 → annuity discount rate
+- Calibrated β/ρ table (`agents/profile/hc_beta_table.py`)
 
-**Nine target occupations (default universe):**
+**Nine target occupations:**
 
 | SOC | Label | HC Type |
 |---|---|---|
@@ -139,10 +138,10 @@ Generates one validated profile per BLS occupation at median salary (or p25/p75 
 | Salary | ~$81,840 | ~$99,890 | ~$130,160 |
 | HC | ~$1.0M | ~$1.5M | ~$2.0M |
 | β | 0.05 | 0.35 | 0.90 |
-| Implicit equity exposure | 4.2% | 33.0% | 86.2% |
-| Portfolio equity target | **+91.6%** | **+48.1%** | **−24.5%** |
+| Implicit equity exposure | ~4% | ~33% | ~86% |
+| Portfolio equity target | **+92%** | **+48%** | **−24%** |
 
-The software developer's career already delivers 86% equity exposure — their portfolio target is negative, meaning they should underweight equities relative to a naive risk-tolerance approach.
+The software developer's career already delivers ~86% equity exposure — their portfolio target is negative, meaning they should underweight equities relative to a naive risk-tolerance approach.
 
 ---
 
@@ -165,43 +164,64 @@ Classifies the current macro regime using a four-stage deterministic pipeline on
 | 3 | Moderate Expansion | 2015-01 → 2019-06 | Stable macro, low volatility |
 | 4 | Inflation Shock | 2022-01 → 2023-06 | Above-target CPI, aggressive tightening |
 
-**Data source:** `data/storage/fred_macro.parquet` (fetched once by `data/fetch/fred.py`).
-
 ---
 
 ### Step 3 — Allocation Agent → `AllocationAgentOutput`
 
-Constructs a Black-Litterman portfolio anchored to the client's residual equity budget after subtracting implicit HC exposure. Receives prior risk and compliance violations on revision runs.
+Constructs a Black-Litterman portfolio anchored to the client's residual equity budget after subtracting implicit HC exposure.
 
-**Key constraint:** `portfolio_equity_target = effective_risk_budget − implicit_equity_exposure` from ProfileAgentOutput.
+**BL pipeline (`agents/shared/core/allocation.py`):**
+1. Build annualised covariance from CRSP monthly excess returns (2000–2024)
+2. CAPM equilibrium returns: `π = δ · Σ · w_mkt`
+3. Fama-French factor views (per-asset expected alpha from FF4 regression)
+4. BL posterior: `μ_BL, Σ_BL`
+5. Mean-variance optimisation with sector + single-name + employer concentration constraints
+6. BMS (1992) `w_fin` scaling → risky / safe weight split
+7. Per-ticker weight decomposition: equilibrium baseline + view tilt + HC offset
 
-**Data source:** `data/storage/prices/{TICKER}.parquet` via `data.fetch.prices.load_returns()`.
+**ETF universe (28 tickers, CRSP-covered):**
+
+| Category | Tickers |
+|---|---|
+| Broad equity | SPY, IWM, EFA, EEM |
+| Fixed income | AGG, TLT, IEF, SHY, HYG, LQD, TIP |
+| Real assets | GLD, VNQ |
+| Sector ETFs | XLK, XLF, XLV, XLE, XLI, XLC, XLY, XLP, XLU, XLRE |
+| Cash proxy | BIL |
+
+**Data source:** WRDS/CRSP monthly returns + Fama-French risk factors → `data/storage/`.
 
 ---
 
 ### Step 4 — Risk Agent → `RiskAgentOutput`
 
-Stress-tests the allocation across all five academic regimes. For equity-like HC clients, sector limits are HC-correlation adjusted:
+Stress-tests the allocation across all five academic regime windows. For equity-like HC clients, sector limits are HC-correlation adjusted:
 
 ```
 adjusted_sector_limit = base_limit × (1 − ρ)
 ```
 
-A software developer (ρ=0.75) faces a tech sector limit of 25% × (1−0.75) = 6.25% — far tighter than the base 25% limit.
+A software developer (ρ=0.75) faces a tech sector limit of 25% × (1−0.75) = **6.25%** — far tighter than the base 25% limit.
 
-Decision: `PASS` → forward to Compliance. `FLAG` → return to Allocation with violations (max 3 revisions). `REJECT` → halt for human review.
+**Risk metrics computed:**
+- Annualised volatility, VaR 95/99, CVaR 95/99
+- Max drawdown vs 80/20 benchmark per regime window
+- Per-ticker marginal risk contribution limits
+- HC-adjusted sector and employer concentration limits
 
-**Data source:** `data/storage/prices/{TICKER}.parquet` for regime-window return distributions.
+**Decision:** `APPROVE` → forward to Compliance. `FLAG` → return violated constraints to Allocation (max 3 revisions). `REJECT` → terminal (portfolio still delivered, failure recorded in metadata).
+
+**Data source:** WRDS/CRSP daily returns → `data/storage/crsp_daily.parquet`.
 
 ---
 
 ### Step 5 — Compliance Agent → `ComplianceAgentOutput`
 
-Two parallel jobs:
+Two parallel jobs (52 deterministic checks):
 
 **Job 1 — Constraint Set Verification (audits Risk Agent)**
 - 1.1 Completeness — all 5 regimes present, every ticker has a limit, derivation fields populated
-- 1.2 Consistency — actual vs limit vs pass/fail flag cross-check
+- 1.2 Consistency — actual weight vs limit vs pass/fail flag cross-check
 - 1.3 Derivation Audit — equity-like HC → `hc_correlation_adjusted` method enforced
 
 **Job 2 — Content & Fiduciary Checks**
@@ -226,52 +246,38 @@ Two parallel jobs:
 **Loop A — Risk → Allocation (max 3 revisions)**
 
 ```python
-while risk.risk_decision == FLAG and risk_revision < 3:
-    allocation = run_allocation_agent(..., prior_risk_flags=risk.violations)
-    risk = run_risk_agent(allocation, profile, macro)
-    risk_revision += 1
+while risk.decision == FLAG and revision < 3:
+    allocation = run_allocation_agent(..., flag_constraints=risk.constraints_violated)
+    risk = run_risk_agent(allocation, profile)
+    revision += 1
 ```
 
-**Loop B — Compliance → Allocation/Risk (max 2 revisions)**
+**Loop B — Compliance → Allocation (max 2 revisions)**
 
 ```python
-while compliance.status == FAIL and comp_revision < 2:
-    if 'allocation_agent' in compliance.agent_feedback:
-        allocation = run_allocation_agent(..., prior_compliance_violations=...)
-        risk = run_risk_agent(allocation, profile, macro)  # must re-run
-    elif 'risk_agent' in compliance.agent_feedback:
-        risk = run_risk_agent(allocation, profile, macro)
-    else:
-        break  # profile/research issue — cannot fix by re-running downstream
-    compliance = run_compliance(assemble_compliance_input(...), risk)
-    comp_revision += 1
+while not compliance.clearance and revision < 2:
+    if "allocation_agent" in compliance.agent_feedback:
+        allocation, _ = run_allocation_agent(...)
+        compliance = run_compliance(assemble_compliance_input(...), risk_ao)
+    revision += 1
 ```
 
 ---
 
 ## Data Layer
 
-All external data is fetched once and cached as parquet in `data/storage/`. Agents read from parquet — they never make live API calls on each run.
+All external data is fetched once and cached as parquet in `data/storage/` (gitignored, ~500 MB budget). Agents read from parquet — they never make live API calls on each pipeline run.
 
-```
-data/
-├── fetch/
-│   ├── fred.py        → fred_macro.parquet + fred_dgs10.parquet
-│   ├── bls.py         → bls_oes.parquet       (xlsx → parquet in-memory)
-│   ├── prices.py      → prices/{TICKER}.parquet  (29 ETFs via yfinance)
-│   └── factors.py     → ff12_monthly.parquet
-└── storage/           (gitignored; ~50-80 MB estimated)
-    ├── fred_macro.parquet
-    ├── fred_dgs10.parquet
-    ├── bls_oes.parquet
-    ├── ff12_monthly.parquet
-    └── prices/
-        ├── SPY.parquet
-        ├── AGG.parquet
-        └── ...
-```
-
-**Budget:** 500 MB total. Run `from data.registry import show_registry; show_registry()` to check current usage.
+| File | Source | Fetcher | Used by |
+|---|---|---|---|
+| `crsp_monthly.parquet` | WRDS/CRSP `msf` | `fetch_crsp_monthly()` | Allocation (BL covariance + market weights) |
+| `crsp_daily.parquet` | WRDS/CRSP `dsf` | `fetch_crsp_daily()` | Risk (VaR, drawdown) |
+| `ff_risk_factors.parquet` | WRDS/FF monthly | `fetch_ff_factors()` | Allocation (FF views) |
+| `ff12_monthly.parquet` | Ken French library | `fetch_ff12()` | Research (regime validation) |
+| `bls_oes.parquet` | BLS OES May 2023 | `fetch_bls_oes()` | Profile (salary distributions) |
+| `fred_macro.parquet` | FRED API | `fetch_fred_macro()` | Research (13 macro series) |
+| `permno_map.json` | WRDS | `fetch_crsp_monthly()` | Allocation + Risk (ticker → PERMNO) |
+| `mkt_cap_weights.json` | WRDS | `fetch_crsp_monthly()` | Allocation (BL equilibrium prior) |
 
 ---
 
@@ -279,97 +285,117 @@ data/
 
 ```
 agentic-portfolio-construction-dev/
-├── contracts.py                  ← All Pydantic inter-agent schemas (source of truth)
-├── orchestrator.py               ← Pipeline runner + dual feedback loops + report renderer
-├── demo.py                       ← Three-persona compliance demo
+├── contracts.py                      ← All Pydantic inter-agent schemas (source of truth)
+├── pipeline_demo.ipynb               ← Full end-to-end demo notebook
 ├── requirements.txt
 │
-├── data/                         ← Centralised data layer (new)
-│   ├── __init__.py               ← STORAGE_DIR, PRICES_DIR path anchors
-│   ├── registry.py               ← show_registry(), budget_status()
+├── data/
+│   ├── __init__.py                   ← STORAGE_DIR path anchor
 │   ├── fetch/
-│   │   ├── fred.py               ← FRED macro + DGS10 → parquet
-│   │   ├── bls.py                ← BLS OES May 2023 → parquet
-│   │   ├── prices.py             ← yfinance ETF universe → parquet
-│   │   └── factors.py            ← Fama-French 12 → parquet
-│   └── storage/                  ← Parquet cache (gitignored)
+│   │   ├── fred.py                   ← FRED macro + DGS10
+│   │   ├── bls.py                    ← BLS OES May 2023 → parquet
+│   │   ├── wrds.py                   ← WRDS/CRSP + FF factors loaders
+│   │   └── factors.py                ← Ken French FF12 + FF risk factor fallback
+│   └── storage/                      ← Parquet cache (gitignored)
 │
-└── agents/
-    ├── profile/                  ← ✅ Implemented
-    │   ├── profile_agent.py      ← run_profile_agent()
-    │   ├── hc_beta_table.py      ← Calibrated β/ρ table
-    │   ├── human_capital.py      ← HC valuation + build_profile()
-    │   ├── personas.py           ← BLS-grounded persona builder
-    │   ├── loaders.py            ← Reads from data/storage/ parquet
-    │   └── test_profile.py
-    │
-    ├── research/                 ← ✅ Implemented
-    │   ├── research_agent.py     ← run_research_agent()
-    │   ├── loaders.py            ← Reads from data/storage/ parquet
-    │   ├── features.py           ← 13-feature engineering pipeline
-    │   ├── detection.py          ← PELT change-point detection
-    │   ├── regime_model.py       ← KMeans + XGBoost + smoothing
-    │   ├── model_comparison.py   ← HMM/GMM benchmarking
-    │   ├── adapters.py           ← MacroRegimeSnapshot builder
-    │   └── test_research.py
-    │
-    ├── compliance/               ← ✅ Implemented (52 unit tests)
-    │   ├── compliance_agent.py   ← run_compliance()
-    │   ├── constraint_checks.py  ← Job 1: audits Risk Agent output
-    │   ├── content_checks.py     ← Job 2: fiduciary checks
-    │   ├── report.py             ← ComplianceAgentOutput assembler
-    │   └── test_compliance.py    ← 52 unit tests (pytest)
-    │
-    ├── allocation/               ← 🔲 Stub — design doc only
-    │   └── Allocation_Agent_README.md
-    │
-    └── risk/                     ← 🔲 Stub — design doc only
-        └── Risk_Agent_README.md
+├── agents/
+│   ├── shared/core/                  ← Quantitative core (no LLM)
+│   │   ├── allocation.py             ← Black-Litterman optimizer
+│   │   ├── risk.py                   ← VaR, drawdown, stress tests, HC metrics
+│   │   ├── constraints.py            ← Limit constants + check functions
+│   │   └── human_capital.py          ← BMS 1992 w_fin, Merton risky share
+│   │
+│   ├── profile/                      ← Agent 1
+│   │   ├── profile_agent.py          ← run_profile_agent() → list[ProfileAgentOutput]
+│   │   ├── hc_beta_table.py          ← Calibrated β/ρ table (Ibbotson 2007)
+│   │   ├── human_capital.py          ← HC valuation + build_profile()
+│   │   ├── personas.py               ← BLS-grounded persona builder
+│   │   ├── loaders.py                ← BLS OES + FRED DGS10 loaders
+│   │   └── test_profile.py
+│   │
+│   ├── research/                     ← Agent 2
+│   │   ├── research_agent.py         ← run_research_agent() → MacroRegimeSnapshot
+│   │   ├── loaders.py                ← FRED macro series loader
+│   │   ├── features.py               ← 13-feature engineering pipeline
+│   │   ├── detection.py              ← PELT change-point detection
+│   │   ├── regime_model.py           ← KMeans + XGBoost + smoothing
+│   │   ├── model_comparison.py       ← HMM/GMM benchmarking (paper validation)
+│   │   └── adapters.py               ← MacroRegimeSnapshot builder
+│   │
+│   ├── allocation/                   ← Agent 3
+│   │   ├── agent.py                  ← run_allocation_agent() → (AllocationOutput, AllocationAgentOutput)
+│   │   └── adapters.py               ← ProfileAgentOutput → AllocationInput; ETF sector map
+│   │
+│   ├── risk/                         ← Agent 4
+│   │   └── agent.py                  ← run_risk_agent() → (RiskOutput, RiskAgentOutput)
+│   │
+│   ├── compliance/                   ← Agent 5
+│   │   ├── compliance_agent.py       ← run_compliance() → ComplianceAgentOutput
+│   │   ├── constraint_checks.py      ← Job 1: audits Risk Agent output
+│   │   ├── content_checks.py         ← Job 2: fiduciary checks
+│   │   ├── report.py                 ← ComplianceAgentOutput assembler
+│   │   └── test_compliance.py        ← 52 unit tests
+│   │
+│   └── orchestrator/
+│       ├── orchestrator.py           ← run_pipeline() / run_all()
+│       └── pipeline.py               ← Allocation ↔ Risk FLAG loop
+│
+└── tests/
+    ├── test_allocation_core.py
+    ├── test_constraints.py
+    └── test_human_capital.py
 ```
 
 ---
 
 ## Setup
 
+### 1. Install dependencies
+
 ```bash
 pip install -r requirements.txt
+```
 
-# Step 1: Fetch all data (one-time setup, ~50-80 MB)
-python - <<'EOF'
-from data.fetch.fred    import fetch_fred_macro, fetch_fred_dgs10
-from data.fetch.bls     import fetch_bls_oes
-from data.fetch.prices  import fetch_all
+### 2. Populate the data cache (one-time, ~10 min, requires WRDS access)
+
+```python
+from data.fetch.wrds import get_connection, fetch_crsp_monthly, fetch_crsp_daily, fetch_ff_factors
+from data.fetch.fred import fetch_fred_macro
+from data.fetch.bls  import fetch_bls_oes
 from data.fetch.factors import fetch_ff12
+from agents.allocation.adapters import DEFAULT_TICKERS
 
-fetch_fred_macro(fred_api_key="YOUR_FRED_KEY")
-fetch_fred_dgs10(fred_api_key="YOUR_FRED_KEY")
-fetch_bls_oes()
-fetch_all()     # 29 ETFs, 2000-2025 — takes ~2 min
-fetch_ff12()
-EOF
+conn = get_connection()                        # prompts for WRDS credentials
+fetch_crsp_monthly(DEFAULT_TICKERS, conn=conn) # crsp_monthly.parquet + permno_map + mkt_cap_weights
+fetch_crsp_daily(DEFAULT_TICKERS, conn=conn)   # crsp_daily.parquet  (~5 min)
+fetch_ff_factors(conn=conn)                    # ff_risk_factors.parquet
 
-# Step 2: Check data budget
-python -c "from data.registry import show_registry; show_registry()"
+fetch_fred_macro(fred_api_key="YOUR_FRED_KEY") # fred_macro.parquet
+fetch_bls_oes()                                # bls_oes.parquet
+fetch_ff12()                                   # ff12_monthly.parquet
+```
 
-# Step 3: Run profile agent (9 BLS personas)
-python -c "
-from agents.profile.profile_agent import run_profile_agent
-profiles = run_profile_agent(fred_api_key='YOUR_FRED_KEY')
-print(f'{len(profiles)} profiles generated')
-"
+### 3. Run the full pipeline
 
-# Step 4: Run research agent
-python -c "
-from agents.research.research_agent import run_research_agent
-snapshot = run_research_agent(fred_api_key='YOUR_FRED_KEY')
-print(snapshot.regime_label, snapshot.regime_confidence)
-"
+```python
+from agents.orchestrator.orchestrator import run_all
 
-# Step 5: Run compliance tests (52 tests, no API keys needed)
-pytest agents/compliance/test_compliance.py -v
+packages = run_all(fred_api_key="YOUR_FRED_KEY")
+# Returns list[AdvisorPackage] — one per BLS persona
+```
 
-# Step 6: Run three-persona compliance demo
-python demo.py
+Or use the demo notebook:
+
+```bash
+jupyter notebook pipeline_demo.ipynb
+```
+
+### 4. Run tests
+
+```bash
+pytest agents/compliance/test_compliance.py -v   # 52 compliance checks
+pytest agents/profile/test_profile.py -v         # HC formula + contract validation
+pytest tests/ -v                                 # allocation core + constraints
 ```
 
 ---
@@ -379,16 +405,17 @@ python demo.py
 **Human Capital Framework**
 - Ibbotson, Milevsky, Chen & Zhu (2007). *Lifetime Financial Advice: Human Capital, Asset Allocation, and Insurance.* CFA Institute Research Foundation.
 - Davis & Willen (2000). *Using Financial Assets to Hedge Labor Income Risks.* SSRN.
-- Campbell & Viceira (2002). *Strategic Asset Allocation.* Oxford University Press.
 - Bodie, Merton & Samuelson (1992). *Labor Supply Flexibility and Portfolio Choice.* Journal of Economic Dynamics and Control.
+- Campbell & Viceira (2002). *Strategic Asset Allocation.* Oxford University Press.
 
-**Regime Detection(needs to be revamped)**
+**Regime Detection**
 - Hamilton, J.D. (1989). *A New Approach to the Economic Analysis of Nonstationary Time Series and the Business Cycle.* Econometrica 57(2).
 - Clarida, Galí & Gertler (1999). *The Science of Monetary Policy.* Journal of Economic Literature 37(4).
 
-**Portfolio Optimisation(needs to be revamped)**
-- Sharpe (1964). *Capital Asset Prices: A Theory of Market Equilibrium under Conditions of Risk.* Journal of Finance.
+**Portfolio Optimisation**
+- Black & Litterman (1992). *Global Portfolio Optimization.* Financial Analysts Journal.
 - Walters (2013). *The Black-Litterman Model in Detail.* SSRN.
+- Sharpe (1964). *Capital Asset Prices: A Theory of Market Equilibrium under Conditions of Risk.* Journal of Finance.
 
 **Regulatory**
 - FINRA Rule 2111 — Suitability
@@ -398,7 +425,7 @@ python demo.py
 
 **Data Sources**
 - FRED (Federal Reserve Bank of St. Louis) — macro series and DGS10
+- WRDS/CRSP — ETF monthly and daily returns, market cap weights
 - BLS OES May 2023 — occupational wage statistics
 - Federal Reserve SCF 2022 — household financial assets
-- yfinance — ETF price history for backtesting
-- Ken French Data Library — Fama-French 12 Industry Portfolios
+- Ken French Data Library — Fama-French factors and 12 Industry Portfolios

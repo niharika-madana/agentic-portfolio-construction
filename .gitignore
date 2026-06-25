@@ -217,16 +217,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Project data storage — parquet files are large and regeneratable
-# Keep data/storage/.gitkeep so the folder exists in the repo
-data/storage/*.parquet
-data/storage/prices/
-data/storage/**/*.parquet
-
-# WRDS/CRSP JSON cache files (populated by data.fetch.wrds.fetch_crsp_*)
-data/storage/permno_map.json
-data/storage/mkt_cap_weights.json
-
 # BLS xlsx cache (legacy — no longer written, but just in case)
 bls_oes_2023_national.xlsx
 

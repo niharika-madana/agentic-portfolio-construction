@@ -87,11 +87,22 @@ class StressSeverity(str, Enum):
     CRITICAL = "critical"
 
 
+class MarketRegime(str, Enum):
+    """
+    Current market volatility regime, detected from 60-day rolling vol vs full-sample baseline.
+    Widens the drawdown cap during stress to prevent procyclical selling at market bottoms.
+    """
+    NORMAL   = "normal"    # rolling/baseline vol ratio < 1.5  — standard caps
+    ELEVATED = "elevated"  # ratio 1.5–2.0                     — caps widened 25%
+    CRISIS   = "crisis"    # ratio ≥ 2.0 (2008/COVID-scale)    — caps widened 50%
+
+
 class ConstraintType(str, Enum):
-    SINGLE_NAME     = "single_name"
-    SECTOR          = "sector"
-    ECONOMIC_SECTOR = "economic_sector"
-    EMPLOYER        = "employer"
+    SINGLE_NAME          = "single_name"
+    SECTOR               = "sector"
+    ECONOMIC_SECTOR      = "economic_sector"
+    EMPLOYER             = "employer"
+    RISK_PROFILE_DOWNGRADE = "risk_profile_downgrade"  # AGGRESSIVE→MODERATE→CONSERVATIVE on critical stress
 
 
 class RiskProfile(str, Enum):
@@ -507,14 +518,16 @@ class HumanCapitalAdjustedMetrics(BaseModel):
 
 
 class RiskMetrics(BaseModel):
-    volatility:       float = Field(..., ge=0)
-    var_cvar:         VaRMetrics
-    max_drawdown:     float = Field(..., ge=0)
-    factor_exposures: FactorExposures
-    liquidity_score:  float = Field(..., ge=0, le=1)
-    concentration:    ConcentrationFlags
-    hc_adjusted:      HumanCapitalAdjustedMetrics
-    stress_results:   list[StressResult]
+    volatility:             float = Field(..., ge=0)
+    var_cvar:               VaRMetrics
+    max_drawdown:           float = Field(..., ge=0)
+    factor_exposures:       FactorExposures
+    liquidity_score:        float = Field(..., ge=0, le=1)
+    concentration:          ConcentrationFlags
+    hc_adjusted:            HumanCapitalAdjustedMetrics
+    stress_results:         list[StressResult]
+    market_regime:          MarketRegime   = MarketRegime.NORMAL
+    effective_drawdown_cap: float          = Field(default=0.20, ge=0, description="Regime-adjusted drawdown cap used for FLAG/REJECT decisions")
 
 
 class RiskOutput(BaseModel):
@@ -595,6 +608,15 @@ class RiskAgentOutput(BaseModel):
     violations:        list[str]
     derivation:        RiskDerivation
     warnings:          list[str]         = Field(default_factory=list)
+
+    market_regime:          Optional[MarketRegime] = Field(
+        default=None,
+        description="Vol-based regime from 60-day rolling vol ratio (NORMAL/ELEVATED/CRISIS)",
+    )
+    effective_drawdown_cap: Optional[float] = Field(
+        default=None, ge=0,
+        description="Regime-adjusted drawdown cap used for FLAG/REJECT decisions",
+    )
 
     portfolio_volatility_annual: Optional[float] = Field(
         default=None,
