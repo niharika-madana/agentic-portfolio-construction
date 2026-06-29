@@ -155,15 +155,17 @@ With 13 features (vs. 6 previously), PELT requires a larger multivariate shift t
 ### `cluster_segments()` Function Contract
 
 ```python
-def cluster_segments(seg_df_input, feature_cols_input, scaler_input=None) -> pd.DataFrame:
+def cluster_segments(features_df, signal_cols, break_dates) -> pd.DataFrame:
 ```
 
-- **Returns:** Input DataFrame with `cluster` column added. **The return value is for downstream diagnostics only — it is NOT consumed by `run_research_agent()`.** XGBoost uses the full monthly feature matrix, not segment fingerprints.
-- **Thread safety:** Protected by `threading.Lock()` — safe to call from parallel pipelines.
-- **Input validation:** Raises `ValueError` with a descriptive message if:
-  - Input DataFrame is empty
-  - Any feature column contains NaN values (with the offending column names logged)
-  - Fewer than 2 segments detected (cannot run K-means)
+- **Returns:** A segment-level DataFrame with a `cluster` column added. **The return value is for downstream diagnostics only — it is NOT consumed by `run_research_agent()`.** XGBoost uses the full monthly feature matrix, not segment fingerprints.
+- **Thread safety:** Protected by a module-level `threading.Lock()` — safe to call from parallel pipelines.
+- **Input validation:** Logs the offending condition and raises `ValueError` (before any clustering work) if:
+  - the input feature matrix is empty
+  - any `signal_cols` entry is absent from the matrix
+  - any signal column contains NaN values (offending columns named in the message)
+  - any `break_dates` entry is not in the feature index, or break indices are non-monotonic
+  - fewer than 2 segments result (cannot run K-means)
 
 The coarse K=2 binary split (Cluster 0: stress/low-growth; Cluster 1: expansion/tightening) is resolved into the 5-regime academic taxonomy by XGBoost in the next step, which operates on the full 274-row monthly feature matrix.
 
