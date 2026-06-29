@@ -1,7 +1,7 @@
 # Research Agent — Design Document
 **AI Financial Advisor Pipeline | Agent 2 of 5**
 *Fordham MSQF Capstone 2026*
-*Last updated: 2026-06-25 (June 25 session — FRED and CRSP data migrated to Parquet cache; MacroRegimeSnapshot contract added; is_low_confidence and regime_change_detected derived fields implemented)*
+*Last updated: 2026-06-30 (June 30 session — PELT parameters exposed as named constants; cluster_segments() refactored with race-condition guard and input validation; HMM/GMM isolated to non-production path; schema alignment notes added; export paths consolidated; pandas pinned to 2.x; Cell 10 segment duration corrected to 19 mo)*
 
 ---
 
@@ -29,6 +29,8 @@ Profile Agent → Research Agent → Allocation Agent → Risk Agent → Complia
 - `agents/research/macro_regime_snapshot.json` — most recent month snapshot
 - `data/storage/fred_macro_regimes.parquet` — compressed feature matrix for downstream agents
 
+All output files must use the paths above. Any new output file must also be registered in `orchestrator/pipeline.py DATA_PATHS`.
+
 > *Ocean (June 11 meeting): "The research agent follows the persona/profile report. Its sole deliverable is a research report, which then becomes the input for the allocation–proposal–risk loop."*
 
 ---
@@ -40,15 +42,15 @@ data/storage/fred_macro.parquet   ← read (fetched by FRED API on first run, ca
     ↓
 Feature engineering (z-scores, log-transforms, first differences, YoY changes)
     ↓
-PELT change-point detection (ruptures) — finds structural breaks without date assumptions
+PELT change-point detection (ruptures, PELT_MODEL="rbf", PELT_PEN=10) — structural breaks without date assumptions
     ↓
-Segment fingerprinting + K-means clustering (optimal K via elbow + silhouette)
+Segment fingerprinting → cluster_segments() [diagnostic only, not consumed downstream]
     ↓
 XGBoost regime mapping (anchor windows → academic taxonomy labels)
     ↓
 6-month rolling majority vote (regime smoothing)
     ↓
-[June 22] HMM & GMM comparison — benchmarked against XGBoost, current pipeline retained
+[NOT IN PRODUCTION PATH] HMM & GMM comparison — benchmarked and rejected; kept in notebook for Future Work section only
     ↓
 Pydantic validation (RegimeRecord — full sequence; MacroRegimeSnapshot — most recent month)
     ↓
@@ -77,7 +79,7 @@ Export: CSV + JSON (regime sequence) + Parquet (feature matrix) + MacroRegimeSna
 | 5Y Treasury Yield | DGS5 | First difference | Mid-curve rate cycle signal |
 | 30Y Treasury Yield | DGS30 | First difference | Long-end anchor |
 
-> **Note:** T5YIE begins 2003, T10YIE begins 2004. After `dropna()`, the usable dataset starts ~2003-02, trimming the pre-2003 period (dot-com bust onset).
+> **Note:** T5YIE begins 2003, T10YIE begins 2004. After `dropna()`, the usable dataset starts ~2003-02, trimming the pre-2003 period (dot-com bust onset). Total rows after dropna: 274 monthly observations (2003-02 through 2025-12).
 
 ---
 
@@ -108,7 +110,16 @@ signal_cols = [
 
 ## Change-Point Detection
 
-**Algorithm:** PELT (Pruned Exact Linear Time) via `ruptures` library, RBF kernel, penalty = 10.
+**Algorithm:** PELT (Pruned Exact Linear Time) via `ruptures` library.
+
+**Parameters** (exposed as named constants in `run_research_agent()` so callers can tune them):
+
+```python
+PELT_PEN   = 10     # regularisation penalty — higher → fewer breakpoints (coarser segmentation)
+                    # lower → more breakpoints (finer; may over-segment on noisy data)
+PELT_MODEL = "rbf"  # kernel — "rbf" captures non-linear signal shifts
+                    # alternatives: "l1" (robust to outliers), "l2" (fast, sensitive to outliers)
+```
 
 **Result (June 2026 run):** 4 structural breaks detected, dividing 2003–2025 into 5 segments.
 
@@ -119,26 +130,42 @@ signal_cols = [
 | 2014-09 | Fed tapering QE; normalising rates; VIX subdued |
 | 2020-12 | COVID shock absorbed; CPI beginning to surge; Fed still at zero |
 
-With 13 features (vs. 6 previously), PELT requires a larger multivariate shift to trigger a break — filtering out minor transitions and retaining only the four most economically significant structural shifts.
+### Resulting Segments (June 2026 Run)
 
-**Notable:** COVID-19 (2020) emerged as a breakpoint with the expanded feature set, unlike the 6-feature version where it had to be added manually as an anchor window.
+| # | Period | Duration | Macro Character |
+|---|---|---|---|
+| 1 | 2003-02 → 2004-08 | ~19 mo | Post dot-com recovery, rates low, spreads tightening |
+| 2 | 2004-09 → 2008-01 | ~40 mo | Credit boom, rising rates, low unemployment, low VIX |
+| 3 | 2008-01 → 2014-09 | ~80 mo | GFC crisis + ZIRP recovery, elevated spreads, high unemployment |
+| 4 | 2014-09 → 2020-12 | ~75 mo | Fed normalisation, low volatility, stable breakevens |
+| 5 | 2020-12 → 2025-12 | ~60 mo | Post-COVID inflation surge, aggressive tightening, AI-driven recovery |
+
+With 13 features (vs. 6 previously), PELT requires a larger multivariate shift to trigger a break — filtering out minor transitions and retaining only the four most economically significant structural shifts.
 
 ---
 
-## Clustering
+## Clustering — `cluster_segments()` [Diagnostic Only]
 
 **Algorithm:** K-means on segment-level fingerprints (mean, variance, delta per signal column).
 
 **Optimal K selection:** Elbow method (WCSS vs K) + silhouette score, K constrained to [2, N_segments − 1].
 
-**Result:** K=2 selected (max silhouette). With only 5 segments, silhouette monotonically favours fewer clusters — this is expected, not a failure. The binary split is economically meaningful:
+**Result:** K=2 selected (max silhouette). With only 5 segments, silhouette monotonically favours fewer clusters — this is expected, not a failure.
 
-| Cluster | Character | Segments |
-|---------|-----------|---------|
-| 0 | Stress / low-growth | Post dot-com recovery, GFC+ZIRP, post-QE normalisation |
-| 1 | Expansion / tightening | Pre-GFC credit boom, post-COVID inflation shock |
+### `cluster_segments()` Function Contract
 
-The coarse K=2 grouping is resolved into the 5-regime academic taxonomy by XGBoost in the next step, which operates on the full 270+ row monthly feature matrix rather than 5 segment fingerprints.
+```python
+def cluster_segments(seg_df_input, feature_cols_input, scaler_input=None) -> pd.DataFrame:
+```
+
+- **Returns:** Input DataFrame with `cluster` column added. **The return value is for downstream diagnostics only — it is NOT consumed by `run_research_agent()`.** XGBoost uses the full monthly feature matrix, not segment fingerprints.
+- **Thread safety:** Protected by `threading.Lock()` — safe to call from parallel pipelines.
+- **Input validation:** Raises `ValueError` with a descriptive message if:
+  - Input DataFrame is empty
+  - Any feature column contains NaN values (with the offending column names logged)
+  - Fewer than 2 segments detected (cannot run K-means)
+
+The coarse K=2 binary split (Cluster 0: stress/low-growth; Cluster 1: expansion/tightening) is resolved into the 5-regime academic taxonomy by XGBoost in the next step, which operates on the full 274-row monthly feature matrix.
 
 ---
 
@@ -147,7 +174,7 @@ The coarse K=2 grouping is resolved into the 5-regime academic taxonomy by XGBoo
 Ad-hoc event labels (Dot-com, COVID, AI Boom) replaced with macro-state definitions grounded in the NBER business cycle and monetary policy literature.
 
 | ID | Academic Label | Definition | Literature |
-|----|---------------|-----------|-----------|
+|----|---------------|-----------|-----------| 
 | 0 | Early Recovery | Post-recession rebound; accommodative policy; credit spreads narrowing | NBER expansion onset; Bernanke (2020) |
 | 1 | Late-Cycle Expansion | Sustained growth; tightening credit; low unemployment | Hamilton (1989) high-growth state |
 | 2 | Financial Crisis & ZLB | Credit stress; rising unemployment; near-zero policy rate; QE | NBER contraction; Clarida et al. (1999) |
@@ -181,7 +208,7 @@ Ad-hoc event labels (Dot-com, COVID, AI Boom) replaced with macro-state definiti
 ### Feature Importance (Actual Values, June 2026 Run)
 
 | Rank | Feature | Importance |
-|------|---------|-----------|
+|------|---------| -----------|
 | 1 | term_spread_z | 0.237 |
 | 2 | cpi_z | 0.226 |
 | 3 | credit_spread_z | 0.166 |
@@ -219,6 +246,8 @@ Ad-hoc event labels (Dot-com, COVID, AI Boom) replaced with macro-state definiti
 ---
 
 ## Model Comparison — HMM & GMM vs. XGBoost
+
+> ⚠️ **NOT IN PRODUCTION PATH.** This section documents the June 22 meeting action item results. HMM/GMM code is excluded from `run_research_agent()` and from `agents/research/research_agent.py`. It is retained in the notebook as a separate manually-executed section for the paper's Future Work discussion only.
 
 *Added June 22 session. Meeting action item: explore HMM and GMM as alternatives or produce a data-driven justification for retaining the current pipeline.*
 
@@ -279,6 +308,8 @@ The comparison provides a clear, data-driven justification for keeping the curre
 
 ## Pydantic Validation
 
+Field names and types here are the authoritative schema. Any rename must be mirrored in `agents/risk/contracts.py` (MacroContextForRisk) and `agents/allocation/contracts.py` (MacroContextForAllocation). `VALID_REGIME_LABELS` is the single source of truth for regime label strings — no inline string literals elsewhere.
+
 ### RegimeRecord — Per-Row Validation
 Every row is validated against `RegimeRecord` before writing to disk. No row with an invalid regime label, out-of-range confidence score, or negative volatility can enter the output JSON.
 
@@ -327,46 +358,46 @@ class MacroRegimeSnapshot(BaseModel):
 ## Output Schema
 
 ### regime_sequence.json — Full Sequence
-Date-keyed JSON of all validated monthly regime records:
+Date-keyed JSON of all validated monthly regime records. June 2026 run: 274 rows, 0 validation failures.
 
 ```json
 {
   "2025-12-01": {
     "regime_label":      "Late-Cycle Expansion",
     "prior_regime":      "Late-Cycle Expansion",
-    "regime_shift_date": "2024-01-01",
-    "regime_confidence": 0.847,
-    "regime_volatility": 0.0312,
+    "regime_shift_date": "2023-08-01",
+    "regime_confidence": 0.902,
+    "regime_volatility": 0.0549,
     "yield_curve":       0.71,
-    "term_spread":       0.43,
+    "term_spread":       0.51,
     "fed_funds":         3.72,
-    "unemployment":      4.1,
-    "cpi":               2.653,
-    "credit_spread":     1.84,
+    "unemployment":      4.4,
+    "cpi":               2.6533,
+    "credit_spread":     1.72,
     "vix":               14.95,
-    "indpro":            1.23
+    "indpro":            1.163
   }
 }
 ```
 
 ### macro_regime_snapshot.json — Most Recent Month
-Single `MacroRegimeSnapshot` object passed to the orchestrator:
+Single `MacroRegimeSnapshot` object passed to the orchestrator. June 2026 run (as_of 2025-12-01):
 
 ```json
 {
-  "as_of":                 "2025-12-01",
-  "regime_label":          "Late-Cycle Expansion",
-  "prior_regime":          "Late-Cycle Expansion",
-  "regime_shift_date":     "2024-01-01",
-  "regime_confidence":     0.847,
-  "regime_volatility":     0.0312,
-  "yield_curve":           0.71,
-  "term_spread":           0.43,
-  "fed_funds":             3.72,
-  "unemployment":          4.1,
-  "cpi":                   2.653,
-  "credit_spread":         1.84,
-  "is_low_confidence":     false,
+  "as_of":                  "2025-12-01",
+  "regime_label":           "Late-Cycle Expansion",
+  "prior_regime":           "Late-Cycle Expansion",
+  "regime_shift_date":      "2023-08-01",
+  "regime_confidence":      0.902,
+  "regime_volatility":      0.0549,
+  "yield_curve":            0.71,
+  "term_spread":             0.51,
+  "fed_funds":              3.72,
+  "unemployment":           4.4,
+  "cpi":                    2.6533,
+  "credit_spread":          1.72,
+  "is_low_confidence":      false,
   "regime_change_detected": false
 }
 ```
@@ -375,7 +406,7 @@ Single `MacroRegimeSnapshot` object passed to the orchestrator:
 
 ## CRSP Validation Results (June 2026 Run)
 
-Regime labels validated against CRSP value-weighted market returns (1995–December 2024). 2025 months excluded — CRSP data not yet publicly available.
+Regime labels validated against CRSP value-weighted market returns (2003–December 2024). 2025 months excluded — CRSP data not yet publicly available.
 
 | Regime | Avg Monthly Return | Std Dev | Months | Expected | Result |
 |--------|-------------------|---------|--------|----------|--------|
@@ -423,27 +454,32 @@ T5YIE and T10YIE begin in 2003–2004, trimming the usable dataset. The pre-2003
 ### Failure Mode 2 — K=2 Is Too Coarse for Regime Labelling
 With only 5 PELT segments, silhouette always favours K=2. The clustering step cannot produce 5 meaningfully distinct clusters.
 
-**Mitigation:** By design — clustering is a sanity check, not the labelling mechanism. XGBoost with 5 anchor windows performs the fine-grained labelling on the full monthly matrix.
+**Mitigation:** By design — `cluster_segments()` is a diagnostic sanity check, not the labelling mechanism. XGBoost with 5 anchor windows performs the fine-grained labelling on the full monthly matrix.
 
 ### Failure Mode 3 — Regime Label Bleed
-Macro fingerprints from different historical periods may be statistically similar (e.g. post dot-com recovery and post-GFC recovery both show accommodative policy and narrowing spreads), causing XGBoost to apply the same label to distinct historical episodes.
+Macro fingerprints from different historical periods may be statistically similar, causing XGBoost to apply the same label to distinct historical episodes.
 
-**Mitigation:** Anchor windows are chosen from the most historically unambiguous core of each segment, avoiding boundary ambiguity. Documented in 10a as a known limitation for the paper.
+**Mitigation:** Anchor windows are chosen from the most historically unambiguous core of each segment, avoiding boundary ambiguity. Documented as a known limitation for the paper.
 
 ### Failure Mode 4 — Pydantic Validation Failure
 A computed row may have `regime_confidence` outside [0, 1] due to floating-point edge cases, or an unlabelled month if `regime_names` mapping is incomplete.
 
-**Mitigation:** `RegimeRecord` validates every row before saving. Failed rows are logged with date and error message; pass/fail counts are printed. The JSON only contains validated rows.
+**Mitigation:** `RegimeRecord` validates every row before saving. Failed rows are logged with date and error message; pass/fail counts are printed. The JSON only contains validated rows. June 2026 run: 274 passed, 0 failed.
 
 ### Failure Mode 5 — CRSP Data Gap (2025)
 CRSP value-weighted returns are only available through December 2024. The 12 most recent months of `features_df` cannot be validated against market returns.
 
-**Mitigation:** The validation join drops NaN rows silently. Documented in 10a. Not correctable until CRSP releases 2025 data.
+**Mitigation:** The validation join drops NaN rows silently. Documented. Not correctable until CRSP releases 2025 data.
 
 ### Failure Mode 6 — FRED API Failure
 FRED is unreachable or the API key is invalid.
 
-**Mitigation:** `data/storage/fred_macro.parquet` is checked first on every run — no API call is made if the parquet cache exists. If the parquet is missing and the API key is unavailable, a `FileNotFoundError` is raised with clear instructions. On first run, each series is fetched independently in a loop so a single series failure does not block others.
+**Mitigation:** `data/storage/fred_macro.parquet` is checked first on every run — no API call is made if the parquet cache exists. If the parquet is missing and the API key is unavailable, a `FileNotFoundError` is raised with clear instructions.
+
+### Failure Mode 7 — cluster_segments() Race Condition
+Multiple pipeline workers writing segment fingerprints simultaneously could produce partial writes or corrupt state.
+
+**Mitigation:** `cluster_segments()` is protected by `threading.Lock()`. Input validation raises `ValueError` with descriptive messages before any write occurs if: (a) the input DataFrame is empty, (b) any feature column contains NaN, or (c) fewer than 2 segments are present.
 
 ---
 
@@ -452,7 +488,9 @@ FRED is unreachable or the API key is invalid.
 - Runs in **Google Colab** with API keys stored via `userdata.get()`
 - FRED API key stored as secret `FRED_API` — only needed on first run
 - No API keys needed after `data/storage/fred_macro.parquet` exists
-- Dependencies: `fredapi`, `xgboost`, `scikit-learn`, `matplotlib`, `ruptures`, `pydantic`, `scipy`, `hmmlearn`, `pyarrow`
+- **Environment:** pandas pinned to `>=2.0,<3.0` across all agents (pandas 3.x caused parquet load errors — team decision June 25 2026)
+- Dependencies: `fredapi`, `xgboost`, `scikit-learn`, `matplotlib`, `ruptures`, `pydantic`, `scipy`, `pyarrow`, `"pandas>=2.0,<3.0"`
+- `hmmlearn` — installed but **not imported in the production path**; only used in the manually-executed HMM/GMM comparison section of the notebook
 - Output files:
   - `agents/research/fred_macro_regimes.csv` — full feature matrix with smoothed regime labels
   - `agents/research/regime_sequence.json` — validated regime sequence passed downstream
