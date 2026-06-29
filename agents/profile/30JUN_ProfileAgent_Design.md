@@ -333,9 +333,9 @@ Higher salary percentile → larger equity grant as a fraction of total compensa
 | **Effective Annual Earnings** | ~$87,782 | ~$107,426 | ~$143,513 |
 | **Age** | 47 | 40 | 38 |
 | **Financial Capital (SCF)** | $200,000 | $90,000 | $90,000 |
-| **Human Capital** | ~$1,046,000 | ~$1,601,000 | ~$2,246,000 |
-| **Total Wealth** | ~$1,246,000 | ~$1,691,000 | ~$2,336,000 |
-| **HC Share** | 0.839 | 0.947 | 0.961 |
+| **Human Capital** | ~$1,075,965 | ~$1,601,000 | ~$2,241,835 |
+| **Total Wealth** | ~$1,275,965 | ~$1,691,000 | ~$2,331,835 |
+| **HC Share** | 0.843 | 0.947 | 0.961 |
 | **σ** | 0.05 | 0.20 | 0.40 |
 | **HC Type** | bond-like | mixed | equity-like |
 | **β** | 0.05 | 0.35 | 0.90 |
@@ -400,16 +400,18 @@ Example output for Biology Professor (p50):
 
 ## Unit Tests
 
-Four deterministic unit tests are included in `test_profile.py` (no live API calls — uses fixed discount rate 4.4%):
+Deterministic unit tests in `test_profile.py` (no live API calls — uses fixed discount rate 4.4%). Beta/correlation are not passed in; `build_profile()` looks them up from `hc_beta_table` by HC type, so the fixtures mirror `build_bls_personas()` output. The four load-bearing cases:
 
 | Test | Persona | What It Checks |
 |---|---|---|
-| Test 1 | Software Developer p50 (salary $130k) | HC formula, β=0.90, bonus_rate=0.085, IEE=HC_share×β |
-| Test 2 | Biology Professor p50 (salary $90k) | bond-like type, β=0.05, pension=True, professor equity_target > developer equity_target |
-| Test 3 | Bad total_wealth (10% off) | `_check_total_wealth_consistency` validator fires |
-| Test 4 | β=0.10 with equity-like type | `_check_hc_type_consistent_with_beta` validator fires |
+| 1 | Software Developer p50 (salary $132,270) | HC annuity formula, β=0.90, effective_salary includes bonus_rate=0.085, IEE = HC_share × β, validates through the contract |
+| 2 | Biology Professor p50 (salary $83,920) | bond-like type, β=0.05, pension=True, professor `portfolio_equity_target` > developer `portfolio_equity_target` |
+| 3 | Bad total_wealth (10% off) | `_check_total_wealth_consistency` validator fires |
+| 4 | β=0.10 with equity-like label | `_check_hc_type_consistent_with_beta` validator fires |
 
-All four tests pass on the June 30 run. HC values confirmed against the annuity formula: Software Developer HC = $2,203,361; Biology Professor HC = $1,153,919.
+Supporting tests cover the annuity formula directly, the effective-risk-budget formula, that the bonus raises HC above a base-salary-only PV, the calibrated `lookup_hc_beta` return type, the holdings-sum validator, and the adapter round-trip — 11 tests, all passing.
+
+HC values confirmed against the annuity formula (r = 4.4%): Software Developer (effective $143,513, n=27) HC = $2,241,835; Biology Professor (effective $87,780, n=18) HC = $1,075,965.
 
 ---
 

@@ -13,23 +13,34 @@ import pandas as pd
 
 
 def detect_change_points(
-    features_df: pd.DataFrame, signal_cols: list[str], pen: float = 10.0
+    features_df: pd.DataFrame,
+    signal_cols: list[str],
+    pen: float = 10.0,
+    model: str = "rbf",
 ):
     """
-    Detect structural breaks via PELT (RBF kernel).
+    Detect structural breaks via PELT.
 
     Returns (break_dates, breakpoints):
       break_dates  — list of pandas Timestamps marking the last month of each
                      completed segment (excludes the final series index)
       breakpoints  — raw ruptures index list (end-exclusive, includes len(df))
 
-    Higher `pen` → fewer breaks.
+    Parameters
+    ----------
+    pen : float
+        Regularisation penalty. Higher → fewer breakpoints (coarser
+        segmentation); lower → more breakpoints (finer, may over-segment noise).
+    model : str
+        ruptures cost model / kernel. "rbf" (default) captures non-linear
+        multivariate signal shifts; "l1" is robust to outliers; "l2" is fast but
+        outlier-sensitive. Controls how large a shift must be to register a break.
     """
     import ruptures as rpt
 
     signal_matrix = features_df[signal_cols].values
-    model = rpt.Pelt(model="rbf").fit(signal_matrix)
-    breakpoints = model.predict(pen=pen)
+    pelt = rpt.Pelt(model=model).fit(signal_matrix)
+    breakpoints = pelt.predict(pen=pen)
 
     break_dates = [features_df.index[i - 1] for i in breakpoints[:-1]]
 

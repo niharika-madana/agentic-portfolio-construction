@@ -19,8 +19,18 @@ Galí & Gertler 1999; Bernanke 2020).
 
 from __future__ import annotations
 
+import logging
+import threading
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# Serialises cluster_segments() so parallel pipeline workers cannot interleave
+# fingerprint construction and produce a partial / corrupt segment frame
+# (design doc Failure Mode 7 — cluster_segments() race condition).
+_CLUSTER_LOCK = threading.Lock()
 
 # Academic regime taxonomy — replaces ad-hoc event labels.
 REGIME_NAMES = {
@@ -42,6 +52,61 @@ ANCHOR_WINDOWS = {
 }
 
 
+def _validate_cluster_inputs(
+    features_df: pd.DataFrame, signal_cols: list[str], break_dates: list
+) -> list[int]:
+    """
+    Data-integrity gate for cluster_segments(). Logs the offending condition and
+    raises ValueError before any clustering work begins if the inputs cannot
+    produce a valid segmentation (design doc Failure Mode 7 acceptance criteria).
+
+    Returns the validated, end-exclusive break_indices list on success.
+    """
+    if features_df is None or features_df.empty:
+        msg = "cluster_segments: input feature matrix is empty"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    missing = [c for c in signal_cols if c not in features_df.columns]
+    if missing:
+        msg = f"cluster_segments: signal columns absent from feature matrix: {missing}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    nan_cols = [c for c in signal_cols if features_df[c].isna().any()]
+    if nan_cols:
+        msg = f"cluster_segments: NaN values present in signal columns {nan_cols}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    out_of_range = [d for d in break_dates if d not in features_df.index]
+    if out_of_range:
+        msg = f"cluster_segments: break dates not found in feature index: {out_of_range}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    break_indices = (
+        [0]
+        + [int(features_df.index.get_loc(d)) for d in break_dates]
+        + [len(features_df)]
+    )
+    if any(b <= a for a, b in zip(break_indices, break_indices[1:])):
+        msg = f"cluster_segments: break indices are non-monotonic: {break_indices}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    n_segments = len(break_indices) - 1
+    if n_segments < 2:
+        msg = (
+            f"cluster_segments: only {n_segments} segment(s) detected — "
+            "at least 2 are required to run K-means"
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+
+    return break_indices
+
+
 def cluster_segments(
     features_df: pd.DataFrame, signal_cols: list[str], break_dates: list
 ) -> pd.DataFrame:
@@ -49,49 +114,56 @@ def cluster_segments(
     Build segment fingerprints (mean/var/delta per signal) and K-means cluster
     them. K is chosen by max silhouette, constrained to [2, n_segments − 1].
     Returns the segment dataframe with a 'cluster' column.
+
+    Diagnostic only: the returned frame is NOT consumed by run_research_agent().
+    XGBoost labels the full monthly feature matrix, not these segment
+    fingerprints. The return value is exposed purely for downstream diagnostics.
+
+    Thread-safe: serialised by a module-level threading.Lock so concurrent
+    pipeline workers cannot interleave and produce a corrupt segment frame.
+    Raises ValueError (before any work) if the input matrix is empty, contains
+    NaNs, references out-of-range break dates, or yields fewer than 2 segments.
     """
     from sklearn.cluster import KMeans
     from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import silhouette_score
 
-    break_indices = (
-        [0]
-        + [features_df.index.get_loc(d) for d in break_dates]
-        + [len(features_df)]
-    )
-    segments = []
-    for i in range(len(break_indices) - 1):
-        start, end = break_indices[i], break_indices[i + 1]
-        seg = features_df.iloc[start:end]
-        seg_features = {}
-        for col in signal_cols:
-            seg_features[f"{col}_mean"] = seg[col].mean()
-            seg_features[f"{col}_var"] = seg[col].var()
-            seg_features[f"{col}_delta"] = seg[col].iloc[-1] - seg[col].iloc[0]
-        seg_features["start_date"] = features_df.index[start]
-        seg_features["end_date"] = features_df.index[end - 1]
-        seg_features["n_months"] = end - start
-        segments.append(seg_features)
+    with _CLUSTER_LOCK:
+        break_indices = _validate_cluster_inputs(features_df, signal_cols, break_dates)
 
-    seg_df = pd.DataFrame(segments)
-    feature_cols = [c for c in seg_df.columns if c not in ("start_date", "end_date", "n_months")]
-    X_seg = StandardScaler().fit_transform(seg_df[feature_cols])
+        segments = []
+        for i in range(len(break_indices) - 1):
+            start, end = break_indices[i], break_indices[i + 1]
+            seg = features_df.iloc[start:end]
+            seg_features = {}
+            for col in signal_cols:
+                seg_features[f"{col}_mean"] = seg[col].mean()
+                seg_features[f"{col}_var"] = seg[col].var()
+                seg_features[f"{col}_delta"] = seg[col].iloc[-1] - seg[col].iloc[0]
+            seg_features["start_date"] = features_df.index[start]
+            seg_features["end_date"] = features_df.index[end - 1]
+            seg_features["n_months"] = end - start
+            segments.append(seg_features)
 
-    k_range = list(range(2, min(5, len(seg_df))))
-    if not k_range:
-        seg_df["cluster"] = 0
-        print("Only one segment — clustering skipped.")
+        seg_df = pd.DataFrame(segments)
+        feature_cols = [c for c in seg_df.columns if c not in ("start_date", "end_date", "n_months")]
+        X_seg = StandardScaler().fit_transform(seg_df[feature_cols])
+
+        k_range = list(range(2, min(5, len(seg_df))))
+        if not k_range:
+            seg_df["cluster"] = 0
+            print("Only two segments — clustering skipped (K-means needs K ≥ 2 < n).")
+            return seg_df
+
+        sil_scores = []
+        for k in k_range:
+            labels = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(X_seg)
+            sil_scores.append(silhouette_score(X_seg, labels))
+
+        best_k = k_range[sil_scores.index(max(sil_scores))]
+        seg_df["cluster"] = KMeans(n_clusters=best_k, random_state=42, n_init=10).fit_predict(X_seg)
+        print(f"Optimal K (max silhouette): {best_k}")
         return seg_df
-
-    sil_scores = []
-    for k in k_range:
-        labels = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(X_seg)
-        sil_scores.append(silhouette_score(X_seg, labels))
-
-    best_k = k_range[sil_scores.index(max(sil_scores))]
-    seg_df["cluster"] = KMeans(n_clusters=best_k, random_state=42, n_init=10).fit_predict(X_seg)
-    print(f"Optimal K (max silhouette): {best_k}")
-    return seg_df
 
 
 def train_and_predict(features_df: pd.DataFrame, signal_cols: list[str]):

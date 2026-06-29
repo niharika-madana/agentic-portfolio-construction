@@ -46,6 +46,11 @@ SEQUENCE_OUTPUT = _THIS_DIR / "regime_sequence.json"
 SNAPSHOT_OUTPUT = _THIS_DIR / "macro_regime_snapshot.json"
 PARQUET_OUTPUT = STORAGE_DIR / "fred_macro_regimes.parquet"
 
+# ── PELT change-point parameters (design doc §Change-Point Detection) ───────
+# Exposed as named constants so callers can tune break-point sensitivity.
+PELT_PEN = 10.0      # penalty — higher → fewer breaks (coarser segmentation)
+PELT_MODEL = "rbf"   # kernel — "rbf" non-linear; "l1" robust; "l2" fast/sensitive
+
 
 def _validate_crsp(features_df) -> None:
     """Optional CRSP return validation — prints avg monthly return per regime."""
@@ -86,7 +91,8 @@ def _save_outputs(features_df, regime_sequence: dict, snapshot: MacroRegimeSnaps
 
 def run_research_agent(
     fred_api_key: str | None = None,
-    pen: float = 10.0,
+    pen: float = PELT_PEN,
+    pelt_model: str = PELT_MODEL,
     save: bool = True,
     validate_crsp: bool = True,
     compare_models: bool = False,
@@ -100,13 +106,18 @@ def run_research_agent(
         Only needed on a cold cache. When data/storage/fred_macro.parquet exists,
         no API call is made.
     pen : float
-        PELT penalty (higher → fewer structural breaks).
+        PELT penalty (higher → fewer structural breaks). Defaults to PELT_PEN.
+    pelt_model : str
+        PELT cost model / kernel ("rbf" non-linear, "l1" robust, "l2" fast).
+        Defaults to PELT_MODEL. Together with `pen` this controls how large a
+        multivariate shift must be to register a structural break.
     save : bool
         Persist CSV / JSON / parquet outputs when True.
     validate_crsp : bool
         Run the optional CRSP return validation when True.
     compare_models : bool
-        Run the optional HMM/GMM benchmark when True.
+        Run the optional HMM/GMM benchmark when True. Off the production path —
+        kept for the paper's Future Work section only (design doc §Model Comparison).
 
     Returns
     -------
@@ -116,8 +127,11 @@ def run_research_agent(
     macro_df = load_macro_data(fred_api_key)
     features_df, signal_cols = build_features(macro_df)
 
-    break_dates, _ = detect_change_points(features_df, signal_cols, pen=pen)
-    cluster_segments(features_df, signal_cols, break_dates)  # sanity check
+    break_dates, _ = detect_change_points(features_df, signal_cols, pen=pen, model=pelt_model)
+    # Diagnostic sanity check only — also gates on empty/NaN/out-of-range inputs.
+    # Its return value is intentionally not consumed; XGBoost labels the full
+    # monthly matrix, not these segment fingerprints (design doc §Clustering).
+    cluster_segments(features_df, signal_cols, break_dates)
 
     _, feat_importance = train_and_predict(features_df, signal_cols)
     print("\n=== Feature Importance ===")

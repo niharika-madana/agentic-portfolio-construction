@@ -131,6 +131,46 @@ def test_build_snapshot_is_contract_and_sets_flags():
     assert snap.is_low_confidence == (snap.regime_confidence < 0.60)
 
 
+# ── cluster_segments race-condition / data-integrity guard ─────────────────
+
+def test_cluster_segments_rejects_empty_matrix():
+    """Empty input matrix raises ValueError before any clustering work."""
+    pytest.importorskip("sklearn")
+    from agents.research.regime_model import cluster_segments
+    with pytest.raises(ValueError, match="empty"):
+        cluster_segments(pd.DataFrame(), list(SIGNAL_COLS), [])
+
+
+def test_cluster_segments_rejects_nan_signal():
+    """A NaN in any signal column is rejected with the offending column logged."""
+    pytest.importorskip("sklearn")
+    from agents.research.regime_model import cluster_segments
+    features_df, signal_cols = build_features(_synthetic_macro(n=36))
+    break_date = features_df.index[len(features_df) // 2]
+    features_df.loc[features_df.index[0], signal_cols[0]] = np.nan
+    with pytest.raises(ValueError, match="NaN"):
+        cluster_segments(features_df, signal_cols, [break_date])
+
+
+def test_cluster_segments_rejects_out_of_range_break():
+    """A break date absent from the feature index is rejected."""
+    pytest.importorskip("sklearn")
+    from agents.research.regime_model import cluster_segments
+    features_df, signal_cols = build_features(_synthetic_macro(n=36))
+    bogus = pd.Timestamp("1900-01-01")
+    with pytest.raises(ValueError, match="not found in feature index"):
+        cluster_segments(features_df, signal_cols, [bogus])
+
+
+def test_cluster_segments_rejects_single_segment():
+    """No break dates → a single segment → cannot run K-means → ValueError."""
+    pytest.importorskip("sklearn")
+    from agents.research.regime_model import cluster_segments
+    features_df, signal_cols = build_features(_synthetic_macro(n=36))
+    with pytest.raises(ValueError, match="segment"):
+        cluster_segments(features_df, signal_cols, [])
+
+
 # ── Full pipeline smoke test (heavy deps) ──────────────────────────────────
 
 def test_full_pipeline_smoke():
