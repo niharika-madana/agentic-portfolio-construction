@@ -1,7 +1,7 @@
 # Profile Agent — Design Document
 **AI Financial Advisor Pipeline | Agent 1 of 5**
 *Fordham MSQF Capstone 2026*
-*Last updated: 2026-06-25 (June 25 session — added industry bonus factor from BLS ECEC Q1 2026; HC formula updated to use effective_salary = base × (1 + bonus_rate))*
+*Last updated: 2026-06-30 (June 30 session — schema alignment enforced; beta.py deprecated and guarded; `include_percentile_variants` exposed on entry point; unit tests added; pandas pinned to 2.x; notebook vs. package persona count documented)*
 
 ---
 
@@ -44,14 +44,14 @@ Single-pass architecture. Beta is known before `build_profile()` is called — t
 ```
 agents/profile/
 ├── loaders.py          FRED DGS10 + BLS OES downloader + SCF static table
-├── hc_beta_table.py    Calibrated β and ρ by HC type (replaces OLS)
+├── hc_beta_table.py    Calibrated β and ρ by HC type (replaces OLS) ← ONLY source of beta/correlation
 ├── personas.py         TARGET_OCCUPATIONS + build_bls_personas()
 ├── human_capital.py    compute_human_capital(), build_profile(), adapter
 ├── profile_agent.py    run_profile_agent() — entry point
 └── test_profile.py     Unit tests (no live API calls)
 ```
 
-`beta.py` is deprecated and raises `ImportError` on import. Use `hc_beta_table.lookup_hc_beta()`.
+`beta.py` is **deprecated** and raises `ImportError` on import. Use `hc_beta_table.lookup_hc_beta()`. Any `from beta import ...` anywhere in the codebase must be removed.
 
 ---
 
@@ -93,7 +93,7 @@ where  HC_share = HC / Total Wealth
        β        = income_equity_beta (from HC_BETA_TABLE)
 ```
 
-> ⚠ The old design doc (June 22) incorrectly stated `Implicit Equity Exposure = (HC × σ) / Total Wealth`. That formula uses income volatility (σ) where it should use income equity beta (β). The correct formula is enforced by the `_check_implicit_equity_exposure` model validator in `contracts.py` (line 232).
+> ⚠ The old design doc (June 22) incorrectly stated `Implicit Equity Exposure = (HC × σ) / Total Wealth`. That formula uses income volatility (σ) where it should use income equity beta (β). The correct formula is enforced by the `_check_implicit_equity_exposure` model validator in `contracts.py`.
 
 ### Portfolio Equity Target
 
@@ -119,7 +119,7 @@ A negative value means the client's career already provides more equity exposure
 
 `β` (income_equity_beta) — systematic sensitivity of income to equity market returns. Used to compute implicit equity exposure.
 
-`ρ` (income_equity_correlation) — correlation of income changes with equity market returns. Used by the Risk Agent to compute HC-correlation adjusted sector limits: `adjusted_limit = base_limit × (1 − ρ)`.
+`ρ` (income_equity_correlation) — correlation of income changes with equity market returns. Used by the Risk Agent to compute HC-correlation adjusted sector limits: `adjusted_limit = base_limit × (1 − ρ)`. A software developer with ρ = 0.75 faces a much tighter technology sector limit than a biology professor with ρ = 0.10.
 
 HC type boundaries (enforced by `contracts.py` `_check_hc_type_consistent_with_beta` validator):
 - `bond-like`: β ≤ 0.30
@@ -205,7 +205,7 @@ Published every 3 years; no live API. Implemented as a static dict in `loaders.S
 
 ## Beta and Correlation — Calibrated Table
 
-Beta and correlation are looked up from a calibrated table keyed by HC type. This replaces the OLS regression in the prior design, which regressed synthetic Gaussian noise (`σ × N(0,1)`) against Fama-French sector returns and produced β ≈ 0 for every client regardless of career type.
+Beta and correlation are looked up from `hc_beta_table.py` — the **only** authorised source. This replaces the OLS regression in the prior design, which regressed synthetic Gaussian noise (`σ × N(0,1)`) against Fama-French sector returns and produced β ≈ 0 for every client regardless of career type.
 
 ```python
 HC_BETA_TABLE = {
@@ -229,7 +229,14 @@ Davis & Willen (2000), *"Using Financial Assets to Hedge Labor Income Risks: Est
 
 ## Persona Construction — BLS + SCF
 
-`build_bls_personas()` generates one persona per target occupation at the median (p50) salary by default. Passing `include_percentile_variants=True` generates three variants per occupation (p25, p50, p75), giving up to 27 personas from 9 occupations.
+`build_bls_personas()` generates personas per target occupation. The `include_percentile_variants` flag controls how many:
+
+| Mode | `include_percentile_variants` | Personas Generated | Use Case |
+|---|---|---|---|
+| Production (package default) | `False` | 9 (p50 only, one per SOC) | Orchestrator default |
+| Extended (notebook default) | `True` | 27 (p25 + p50 + p75 per SOC) | Sensitivity analysis, full audit |
+
+The same flag is exposed on the entry point `run_profile_agent(include_percentile_variants=False)` so the orchestrator can reproduce either set deterministically.
 
 ### Target Occupations (9)
 
@@ -322,7 +329,7 @@ Higher salary percentile → larger equity grant as a fraction of total compensa
 |---|---|---|---|
 | **SOC** | 25-1042 | 13-2051 | 15-1252 |
 | **BLS Median Salary** | ~$83,920 | ~$99,010 | ~$132,270 |
-| **Bonus Rate (BLS ECEC)** | 4.6% | 8.5% | 8.5% |
+| **Bonus Rate (BLS ECEC Q1 2026)** | 4.6% | 8.5% | 8.5% |
 | **Effective Annual Earnings** | ~$87,782 | ~$107,426 | ~$143,513 |
 | **Age** | 47 | 40 | 38 |
 | **Financial Capital (SCF)** | $200,000 | $90,000 | $90,000 |
@@ -346,7 +353,7 @@ The biology professor's bond-like income — a stable, government-indifferent sa
 
 ## Output Schema
 
-`ProfileAgentOutput` is defined in `contracts.py` and validated by four `model_validator` functions:
+`ProfileAgentOutput` is defined in `contracts.py` and validated by four `model_validator` functions. Field names and types here are the authoritative schema — any rename must be mirrored in `agents/risk/contracts.py` (RiskAgentInput) and `agents/research/contracts.py` (ProfileContextForResearch):
 
 1. `_check_holdings_sum` — `current_holdings` weights must sum to 1.0 ± 0.01
 2. `_check_total_wealth_consistency` — `total_wealth == financial_capital + human_capital_valuation` within 0.5%
@@ -361,9 +368,9 @@ Example output for Biology Professor (p50):
   "career_type": "Academia",
   "age": 47,
   "financial_capital": 200000,
-  "human_capital_valuation": 1000085,
-  "total_wealth": 1200085,
-  "human_capital_pct_of_total": 83.3,
+  "human_capital_valuation": 1075965,
+  "total_wealth": 1275965,
+  "human_capital_pct_of_total": 84.3,
   "income_volatility_sigma": 0.05,
   "income_equity_beta": 0.05,
   "income_equity_correlation": 0.10,
@@ -388,6 +395,21 @@ Example output for Biology Professor (p50):
   "investment_objective": "growth"
 }
 ```
+
+---
+
+## Unit Tests
+
+Four deterministic unit tests are included in `test_profile.py` (no live API calls — uses fixed discount rate 4.4%):
+
+| Test | Persona | What It Checks |
+|---|---|---|
+| Test 1 | Software Developer p50 (salary $130k) | HC formula, β=0.90, bonus_rate=0.085, IEE=HC_share×β |
+| Test 2 | Biology Professor p50 (salary $90k) | bond-like type, β=0.05, pension=True, professor equity_target > developer equity_target |
+| Test 3 | Bad total_wealth (10% off) | `_check_total_wealth_consistency` validator fires |
+| Test 4 | β=0.10 with equity-like type | `_check_hc_type_consistent_with_beta` validator fires |
+
+All four tests pass on the June 30 run. HC values confirmed against the annuity formula: Software Developer HC = $2,203,361; Biology Professor HC = $1,153,919.
 
 ---
 
@@ -446,18 +468,21 @@ FRED is unreachable or the API key is invalid.
 ## Implementation Notes
 
 - **Entry point:** `agents/profile/profile_agent.py` → `run_profile_agent()`
+- **Beta source:** `agents/profile/hc_beta_table.py` — the only authorised source. `beta.py` is deprecated and raises `ImportError`.
+- **Environment:** pandas pinned to `>=2.0,<3.0` across all agents (pandas 3.x caused parquet load errors — team decision June 25 2026)
 - **BLS OES source file:** `national_M2023_dl.xlsx` — converted and cached as `data/storage/bls_oes_2023.parquet` on first run
 - **Output (JSON):** `agents/profile/profiles_all.json`
 - **Output (Parquet):** `data/storage/profiles_all.parquet` — consumed by Allocation, Risk, Compliance agents
 - **Runtime environment:** Google Colab or local Python 3.11+
 - **API keys needed:** `FRED_API` only. No Anthropic or OpenAI keys required.
-- **Dependencies:** `requests`, `pandas`, `openpyxl`, `numpy`, `pydantic`
+- **Dependencies:** `requests`, `"pandas>=2.0,<3.0"`, `openpyxl`, `numpy`, `pydantic`
 - **Removed dependencies:** `anthropic`, `openai`, `scipy`, `ruptures`, `sklearn` (no longer used by profile agent)
 
 ### Default run (9 personas, p50 only)
 ```python
 from agents.profile.profile_agent import run_profile_agent
 profiles = run_profile_agent(fred_api_key="YOUR_KEY")
+# include_percentile_variants defaults to False → 9 personas
 ```
 
 ### Extended run (27 personas, p25 + p50 + p75)
@@ -466,4 +491,5 @@ profiles = run_profile_agent(
     fred_api_key="YOUR_KEY",
     include_percentile_variants=True,
 )
+# → 27 personas (9 SOC codes × 3 percentiles)
 ```
