@@ -31,11 +31,9 @@ from pydantic import ValidationError
 
 from contracts import ProfileAgentOutput
 
-from agents.profile.hc_beta_table import (
+from agents.profile.profile_model import (
     INCOME_VOLATILITY_SIGMA,
     lookup_hc_beta,
-)
-from agents.profile.human_capital import (
     build_profile,
     compute_human_capital,
     to_profile_agent_output,

@@ -1,15 +1,13 @@
 """
-profile_agent.py — Profile Agent entry point (Agent 1 of 5).
+profile_agent.py: Profile Agent entry point (Agent 2 of 5).
 
-run_profile_agent() builds and validates one ProfileAgentOutput per BLS
-occupation (median salary by default, or p25/p50/p75 with
+run_profile_agent() builds and validates one ProfileAgentOutput per BLS occupation (median salary by default, or p25/p50/p75 with
 include_percentile_variants=True) and optionally persists them:
 
-    agents/profile/profiles_all.json      — list of validated profiles
+    data/outputs/profiles_all.json        — list of validated profiles
     data/storage/profiles_all.parquet     — consumed by Allocation/Risk/Compliance
 
-The returned list[ProfileAgentOutput] feeds straight into
-orchestrator.run_all(personas, macro).
+The returned list[ProfileAgentOutput] feeds straight into orchestrator.run_all(personas, macro).
 """
 
 from __future__ import annotations
@@ -17,17 +15,61 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pandas as pd
+
 from contracts import ProfileAgentOutput
 
-from agents.profile.human_capital import build_profile, to_profile_agent_output
-from agents.profile.loaders import get_discount_rate, load_bls_oes
-from agents.profile.personas import build_bls_personas
+from agents.profile.profile_model import build_profile, to_profile_agent_output, build_bls_personas
 
 _THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = _THIS_DIR.parent.parent
-STORAGE_DIR = PROJECT_ROOT / "data" / "storage"
+STORAGE_DIR  = PROJECT_ROOT / "data" / "storage"
+OUTPUTS_DIR  = PROJECT_ROOT / "data" / "outputs"
 
-JSON_OUTPUT = _THIS_DIR / "profiles_all.json"
+_BLS_PARQUET = STORAGE_DIR / "bls_oes.parquet"
+_FALLBACK_DISCOUNT_RATE = 0.044
+
+
+def _get_discount_rate(api_key: str | None = None) -> float:
+    """Return DGS10 as a decimal — cache → live FRED → 4.4% fallback."""
+    try:
+        from data.fetch.fred import latest_dgs10
+        rate = latest_dgs10(fred_api_key=api_key, fallback=_FALLBACK_DISCOUNT_RATE)
+        if rate != _FALLBACK_DISCOUNT_RATE:
+            return float(rate)
+    except Exception:
+        pass
+
+    if api_key:
+        try:
+            import requests
+            url = (
+                "https://api.stlouisfed.org/fred/series/observations"
+                f"?series_id=DGS10&api_key={api_key}"
+                "&sort_order=desc&limit=1&file_type=json"
+            )
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            rate = float(resp.json()["observations"][0]["value"]) / 100.0
+            print(f"FRED DGS10 (10Y Treasury): {rate:.4f}")
+            return rate
+        except Exception as e:
+            print(f"FRED fetch failed ({e}); using fallback rate {_FALLBACK_DISCOUNT_RATE}")
+
+    print(f"DGS10 unavailable; using fallback discount rate {_FALLBACK_DISCOUNT_RATE}")
+    return _FALLBACK_DISCOUNT_RATE
+
+
+def _load_bls_oes() -> pd.DataFrame:
+    """Read BLS OES from shared parquet cache; fetch if missing. OCC_CODE is the index."""
+    if not _BLS_PARQUET.exists():
+        from data.fetch.bls import fetch_bls_oes
+        fetch_bls_oes()
+    oes_df = pd.read_parquet(_BLS_PARQUET)
+    print(f"Loaded BLS OES from parquet cache: {_BLS_PARQUET}")
+    return oes_df
+
+JSON_OUTPUT    = OUTPUTS_DIR / "profiles_all.json"
 PARQUET_OUTPUT = STORAGE_DIR / "profiles_all.parquet"
 
 
@@ -51,7 +93,7 @@ def save_profiles(outputs: list[ProfileAgentOutput]) -> None:
     """Persist profiles to JSON and (if pandas/pyarrow are available) parquet."""
     profiles_as_dicts = [out.model_dump(mode="json") for out in outputs]
 
-    JSON_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     with open(JSON_OUTPUT, "w") as f:
         json.dump(profiles_as_dicts, f, indent=2)
     print(f"Saved {len(profiles_as_dicts)} profiles → {JSON_OUTPUT}")
@@ -91,10 +133,10 @@ def run_profile_agent(
     -------
     list[ProfileAgentOutput]
     """
-    discount_rate = get_discount_rate(fred_api_key)
+    discount_rate = _get_discount_rate(fred_api_key)
     print(f"Discount rate (FRED DGS10): {discount_rate:.4f}")
 
-    oes_df = load_bls_oes()
+    oes_df = _load_bls_oes()
     raw_personas = build_bls_personas(
         oes_df, include_percentile_variants=include_percentile_variants
     )

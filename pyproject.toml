@@ -20,6 +20,9 @@ dependencies = [
     "yfinance>=1.4.1",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "ipykernel>=7.3.0",

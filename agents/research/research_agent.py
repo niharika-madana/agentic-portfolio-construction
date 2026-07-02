@@ -1,5 +1,5 @@
 """
-research_agent.py — Research Agent entry point (Agent 2 of 5).
+research_agent.py  - Research Agent entry point (Agent 1 of 5).
 
 run_research_agent() runs the four-stage deterministic pipeline on 13 FRED macro
 series and returns a validated MacroRegimeSnapshot for the most recent month:
@@ -7,11 +7,11 @@ series and returns a validated MacroRegimeSnapshot for the most recent month:
   FRED macro (cache) → features → PELT breaks → K-means sanity clustering
   → XGBoost regime mapping → 6-month majority-vote smoothing → Pydantic
 
-Side-effect outputs (design doc §Implementation Notes):
-  agents/research/fred_macro_regimes.csv      full smoothed feature matrix
-  agents/research/regime_sequence.json        validated date-keyed sequence
-  agents/research/macro_regime_snapshot.json  most recent MacroRegimeSnapshot
-  data/storage/fred_macro_regimes.parquet     feature matrix for downstream agents
+Side-effect outputs (Implementation Notes):
+  data/outputs/fred_macro_regimes.csv      full smoothed feature matrix
+  data/outputs/regime_sequence.json        validated date-keyed sequence (month-by-month)
+  data/outputs/macro_regime_snapshot.json  most recent MacroRegimeSnapshot
+  data/storage/fred_macro_regimes.parquet  feature matrix for downstream agents
 
 The returned snapshot feeds straight into orchestrator.run_all(personas, macro).
 """
@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pandas as pd
+
 from contracts import MacroRegimeSnapshot
 
 from agents.research.adapters import (
@@ -28,23 +30,25 @@ from agents.research.adapters import (
     build_regime_sequence,
     build_snapshot,
 )
-from agents.research.detection import detect_change_points
-from agents.research.features import build_features
-from agents.research.loaders import load_crsp, load_macro_data
-from agents.research.regime_model import (
+from agents.research.pipeline import (
+    build_features,
+    detect_change_points,
     cluster_segments,
-    smooth_regimes,
     train_and_predict,
+    smooth_regimes,
 )
 
 _THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = _THIS_DIR.parent.parent
-STORAGE_DIR = PROJECT_ROOT / "data" / "storage"
+STORAGE_DIR  = PROJECT_ROOT / "data" / "storage"
+OUTPUTS_DIR  = PROJECT_ROOT / "data" / "outputs"
 
-CSV_OUTPUT = _THIS_DIR / "fred_macro_regimes.csv"
-SEQUENCE_OUTPUT = _THIS_DIR / "regime_sequence.json"
-SNAPSHOT_OUTPUT = _THIS_DIR / "macro_regime_snapshot.json"
-PARQUET_OUTPUT = STORAGE_DIR / "fred_macro_regimes.parquet"
+CSV_OUTPUT      = OUTPUTS_DIR / "fred_macro_regimes.csv"
+SEQUENCE_OUTPUT = OUTPUTS_DIR / "regime_sequence.json"
+SNAPSHOT_OUTPUT = OUTPUTS_DIR / "macro_regime_snapshot.json"
+PARQUET_OUTPUT  = STORAGE_DIR / "fred_macro_regimes.parquet"
+MACRO_PARQUET   = STORAGE_DIR / "fred_macro.parquet"
+_CRSP_PARQUET   = STORAGE_DIR / "crsp_market_index.parquet"
 
 # ── PELT change-point parameters (design doc §Change-Point Detection) ───────
 # Exposed as named constants so callers can tune break-point sensitivity.
@@ -52,9 +56,35 @@ PELT_PEN = 10.0      # penalty — higher → fewer breaks (coarser segmentation
 PELT_MODEL = "rbf"   # kernel — "rbf" non-linear; "l1" robust; "l2" fast/sensitive
 
 
+def _load_macro_data(
+    fred_api_key: str | None = None,
+    start: str = "1995-01-01",
+    end: str = "2025-12-31",
+) -> pd.DataFrame:
+    """Return the 13-series macro frame from cache; fetch via shared fetcher if missing."""
+    if MACRO_PARQUET.exists():
+        return pd.read_parquet(MACRO_PARQUET)
+    if not fred_api_key:
+        raise FileNotFoundError(
+            f"Cache missing at {MACRO_PARQUET} and no FRED API key supplied. "
+            "Run data.fetch.fred.fetch_fred_macro(fred_api_key=...) first."
+        )
+    from data.fetch.fred import fetch_fred_macro
+    fetch_fred_macro(fred_api_key=fred_api_key, start=start, end=end)
+    return pd.read_parquet(MACRO_PARQUET)
+
+
+def _load_crsp() -> pd.DataFrame | None:
+    """Return CRSP value-weighted market returns for optional regime validation, or None."""
+    if _CRSP_PARQUET.exists():
+        return pd.read_parquet(_CRSP_PARQUET)
+    print("CRSP data not found — skipping return validation.")
+    return None
+
+
 def _validate_crsp(features_df) -> None:
     """Optional CRSP return validation — prints avg monthly return per regime."""
-    crsp = load_crsp()
+    crsp = _load_crsp()
     if crsp is None or "vwretd" not in getattr(crsp, "columns", []):
         return
     validation_df = features_df[["regime_label_smoothed"]].join(crsp[["vwretd"]], how="left")
@@ -68,7 +98,7 @@ def _validate_crsp(features_df) -> None:
 
 
 def _save_outputs(features_df, regime_sequence: dict, snapshot: MacroRegimeSnapshot) -> None:
-    _THIS_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
     features_df.to_csv(CSV_OUTPUT)
@@ -124,7 +154,7 @@ def run_research_agent(
     MacroRegimeSnapshot
         Validated snapshot for the most recent month.
     """
-    macro_df = load_macro_data(fred_api_key)
+    macro_df = _load_macro_data(fred_api_key)
     features_df, signal_cols = build_features(macro_df)
 
     break_dates, _ = detect_change_points(features_df, signal_cols, pen=pen, model=pelt_model)

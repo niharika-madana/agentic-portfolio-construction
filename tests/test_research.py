@@ -17,7 +17,7 @@ import pandas as pd
 import pytest
 
 from contracts import MacroRegimeSnapshot
-from agents.research.features import SIGNAL_COLS, build_features
+from agents.research.pipeline import SIGNAL_COLS, build_features
 from agents.research.adapters import (
     RegimeRecord,
     add_derived_fields,
@@ -136,7 +136,7 @@ def test_build_snapshot_is_contract_and_sets_flags():
 def test_cluster_segments_rejects_empty_matrix():
     """Empty input matrix raises ValueError before any clustering work."""
     pytest.importorskip("sklearn")
-    from agents.research.regime_model import cluster_segments
+    from agents.research.pipeline import cluster_segments
     with pytest.raises(ValueError, match="empty"):
         cluster_segments(pd.DataFrame(), list(SIGNAL_COLS), [])
 
@@ -144,7 +144,7 @@ def test_cluster_segments_rejects_empty_matrix():
 def test_cluster_segments_rejects_nan_signal():
     """A NaN in any signal column is rejected with the offending column logged."""
     pytest.importorskip("sklearn")
-    from agents.research.regime_model import cluster_segments
+    from agents.research.pipeline import cluster_segments
     features_df, signal_cols = build_features(_synthetic_macro(n=36))
     break_date = features_df.index[len(features_df) // 2]
     features_df.loc[features_df.index[0], signal_cols[0]] = np.nan
@@ -155,7 +155,7 @@ def test_cluster_segments_rejects_nan_signal():
 def test_cluster_segments_rejects_out_of_range_break():
     """A break date absent from the feature index is rejected."""
     pytest.importorskip("sklearn")
-    from agents.research.regime_model import cluster_segments
+    from agents.research.pipeline import cluster_segments
     features_df, signal_cols = build_features(_synthetic_macro(n=36))
     bogus = pd.Timestamp("1900-01-01")
     with pytest.raises(ValueError, match="not found in feature index"):
@@ -165,7 +165,7 @@ def test_cluster_segments_rejects_out_of_range_break():
 def test_cluster_segments_rejects_single_segment():
     """No break dates → a single segment → cannot run K-means → ValueError."""
     pytest.importorskip("sklearn")
-    from agents.research.regime_model import cluster_segments
+    from agents.research.pipeline import cluster_segments
     features_df, signal_cols = build_features(_synthetic_macro(n=36))
     with pytest.raises(ValueError, match="segment"):
         cluster_segments(features_df, signal_cols, [])
@@ -177,8 +177,7 @@ def test_full_pipeline_smoke():
     pytest.importorskip("ruptures")
     pytest.importorskip("xgboost")
     pytest.importorskip("scipy")
-    from agents.research.detection import detect_change_points
-    from agents.research.regime_model import train_and_predict, smooth_regimes
+    from agents.research.pipeline import detect_change_points, train_and_predict, smooth_regimes
 
     features_df, signal_cols = build_features(_synthetic_macro(n=300))
     # PELT may find few/no breaks on noise — that is fine for a smoke test.

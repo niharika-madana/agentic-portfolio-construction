@@ -1,9 +1,8 @@
 """
-Orchestrator — full five-agent pipeline control plane.
+orchestrator_agent.py — full five-agent pipeline control plane.
 
-Entry points:
+Entry point:
     run_pipeline(profile, macro, fred_api_key) → AdvisorPackage
-    run_all(fred_api_key)                       → list[AdvisorPackage]  (all 9 BLS personas)
 
 Pipeline sequence:
   1. Pre-flight checks (low-confidence macro warning)
@@ -22,6 +21,8 @@ import logging
 import sys
 import os
 
+import pandas as pd
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from contracts import (
@@ -31,13 +32,77 @@ from contracts import (
     ProfileAgentOutput, RegimeChangeFlag, RiskAgentOutput, RiskDecision,
     RiskOutput, RunMetadata,
 )
+from agents.allocation.agent import run_allocation_agent
 from agents.compliance.compliance_agent import run_compliance
-from agents.orchestrator.pipeline import run_alloc_risk_loop
+from agents.risk.agent import run_risk_agent
 from data.fetch.fred import latest_dgs10
+from data.fetch.wrds import load_ff_factors
 
 logger = logging.getLogger(__name__)
 
+_MAX_FLAG_ITERATIONS     = 3
 _MAX_COMPLIANCE_REVISIONS = 2
+
+
+# ---------------------------------------------------------------------------
+# Allocation ↔ Risk FLAG loop
+# ---------------------------------------------------------------------------
+
+def run_alloc_risk_loop(
+    profile:       ProfileAgentOutput,
+    discount_rate: float,
+    ff_factors:    pd.DataFrame | None = None,
+) -> tuple[AllocationOutput, RiskOutput, RiskAgentOutput, AllocationAgentOutput, int]:
+    """
+    Run the Allocation ↔ Risk FLAG feedback loop for one client profile.
+
+    Returns (AllocationOutput, RiskOutput, RiskAgentOutput, AllocationAgentOutput, revisions)
+    where revisions = number of FLAG re-entries (0 = first run passed).
+    """
+    if ff_factors is None:
+        ff_factors = load_ff_factors()
+
+    flag_constraints = []
+    flag_iteration   = 0
+    alloc_output: AllocationOutput | None     = None
+    risk_output:  RiskOutput | None           = None
+    risk_ao:      RiskAgentOutput | None      = None
+    alloc_ao:     AllocationAgentOutput | None = None
+
+    for iteration in range(_MAX_FLAG_ITERATIONS + 1):
+        label = "First run" if iteration == 0 else f"FLAG re-entry #{iteration}"
+        logger.info(f"[pipeline] Iteration {iteration + 1}  ({label})")
+
+        alloc_output, alloc_ao = run_allocation_agent(
+            profile          = profile,
+            discount_rate    = discount_rate,
+            ff_factors       = ff_factors,
+            flag_constraints = flag_constraints,
+            flag_iteration   = flag_iteration,
+        )
+
+        logger.info(
+            f"[pipeline] Allocation done — risky {alloc_output.risky_weight:.1%} "
+            f"E[r] {alloc_output.portfolio_statistics.expected_return:.2%} "
+            f"vol {alloc_output.portfolio_statistics.volatility:.2%}"
+        )
+
+        risk_output, risk_ao = run_risk_agent(
+            allocation_output = alloc_output,
+            profile           = profile,
+        )
+
+        logger.info(f"[pipeline] Risk decision: {risk_output.decision.value}")
+
+        if risk_output.decision in (RiskDecision.APPROVE, RiskDecision.REJECT):
+            return alloc_output, risk_output, risk_ao, alloc_ao, iteration
+
+        # FLAG — feed tightened constraints back into next allocation run
+        flag_constraints = risk_output.constraints_violated
+        flag_iteration   = iteration + 1
+
+    # Safety fallback (should not reach here — iteration 3 always REJECTs)
+    return alloc_output, risk_output, risk_ao, alloc_ao, _MAX_FLAG_ITERATIONS
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +119,9 @@ def _regime_volatility_label(v: float) -> str:
 
 
 def assemble_compliance_input(
-    profile:     ProfileAgentOutput,
-    macro:       MacroRegimeSnapshot,
-    alloc_ao:    AllocationAgentOutput,
+    profile:  ProfileAgentOutput,
+    macro:    MacroRegimeSnapshot,
+    alloc_ao: AllocationAgentOutput,
 ) -> ComplianceInput:
     """Build the ComplianceInput the Compliance Agent expects."""
     return ComplianceInput(
@@ -103,9 +168,9 @@ def assemble_compliance_input(
 # ---------------------------------------------------------------------------
 
 def run_pipeline(
-    profile:       ProfileAgentOutput,
-    macro:         MacroRegimeSnapshot,
-    fred_api_key:  str | None = None,
+    profile:      ProfileAgentOutput,
+    macro:        MacroRegimeSnapshot,
+    fred_api_key: str | None = None,
 ) -> AdvisorPackage:
     """
     Run the full five-agent pipeline for one client.
@@ -131,8 +196,8 @@ def run_pipeline(
 
     # Step 3 — Allocation ↔ Risk loop
     alloc_output, risk_output, risk_ao, alloc_ao, risk_revisions = run_alloc_risk_loop(
-        profile        = profile,
-        discount_rate  = discount_rate,
+        profile       = profile,
+        discount_rate = discount_rate,
     )
 
     if risk_output.decision == RiskDecision.REJECT:
@@ -153,7 +218,6 @@ def run_pipeline(
         if not compliance_output.agent_feedback:
             break
 
-        # Re-run allocation if allocation_agent has actionable feedback
         if "allocation_agent" in compliance_output.agent_feedback:
             feedback_violations = [
                 item.action_required
@@ -190,54 +254,15 @@ def run_pipeline(
 
 
 def _revise_allocation_for_compliance(
-    profile:              ProfileAgentOutput,
-    discount_rate:        float,
-    current_iteration:    int,
+    profile:               ProfileAgentOutput,
+    discount_rate:         float,
+    current_iteration:     int,
     compliance_violations: list[str],
 ) -> tuple[AllocationOutput, AllocationAgentOutput]:
     """Re-run allocation with compliance violations as additional context."""
-    from agents.allocation.agent import run_allocation_agent
     return run_allocation_agent(
-        profile          = profile,
-        discount_rate    = discount_rate,
-        flag_iteration   = min(current_iteration + 1, 3),
+        profile        = profile,
+        discount_rate  = discount_rate,
+        flag_iteration = min(current_iteration + 1, 3),
     )
 
-
-# ---------------------------------------------------------------------------
-# Batch run — all 9 BLS personas
-# ---------------------------------------------------------------------------
-
-def run_all(
-    fred_api_key: str | None = None,
-    macro:        MacroRegimeSnapshot | None = None,
-) -> list[AdvisorPackage]:
-    """
-    Run the full pipeline for all 9 BLS personas (p50 salary tier).
-
-    Args:
-        fred_api_key: FRED API key. Uses 4.4% fallback if None.
-        macro:        MacroRegimeSnapshot. If None, runs the Research Agent first.
-
-    Returns:
-        List of AdvisorPackage, one per persona.
-    """
-    from agents.profile.profile_agent import run_profile_agent
-    from agents.research.research_agent import run_research_agent
-
-    if macro is None:
-        logger.info("[orchestrator] Running Research Agent to get current regime...")
-        macro = run_research_agent(fred_api_key)
-
-    profiles = run_profile_agent(fred_api_key=fred_api_key)
-
-    packages: list[AdvisorPackage] = []
-    for profile in profiles:
-        logger.info(f"[orchestrator] Running pipeline for persona: {profile.client_id}")
-        try:
-            pkg = run_pipeline(profile, macro, fred_api_key=fred_api_key)
-            packages.append(pkg)
-        except Exception as e:
-            logger.error(f"[orchestrator] Pipeline failed for {profile.client_id}: {e}")
-
-    return packages
