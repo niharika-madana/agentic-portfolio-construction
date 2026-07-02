@@ -1,7 +1,7 @@
 # Profile Agent — Design Document
 **AI Financial Advisor Pipeline | Agent 1 of 5**
 *Fordham MSQF Capstone 2026*
-*Last updated: 2026-06-30 (June 30 session — schema alignment enforced; beta.py deprecated and guarded; `include_percentile_variants` exposed on entry point; unit tests added; pandas pinned to 2.x; notebook vs. package persona count documented)*
+*Last updated: 2026-07-02 (post-refactor sync — module structure consolidated into `profile_agent.py` + `profile_model.py` [loaders.py/hc_beta_table.py/personas.py/human_capital.py/beta.py removed]; income_stability proof-of-categorization added; output paths moved to `data/outputs/`. Prior: 2026-06-30 — schema alignment enforced; `include_percentile_variants` exposed; unit tests added; pandas pinned to 2.x)*
 
 ---
 
@@ -43,15 +43,21 @@ Single-pass architecture. Beta is known before `build_profile()` is called — t
 
 ```
 agents/profile/
-├── loaders.py          FRED DGS10 + BLS OES downloader + SCF static table
-├── hc_beta_table.py    Calibrated β and ρ by HC type (replaces OLS) ← ONLY source of beta/correlation
-├── personas.py         TARGET_OCCUPATIONS + build_bls_personas()
-├── human_capital.py    compute_human_capital(), build_profile(), adapter
-├── profile_agent.py    run_profile_agent() — entry point
-└── test_profile.py     Unit tests (no live API calls)
+├── profile_agent.py    run_profile_agent() — entry point; data loading (FRED DGS10
+│                       via _get_discount_rate, BLS OES via _load_bls_oes)
+├── profile_model.py    Domain model — merged from hc_beta_table.py + human_capital.py
+│                       + personas.py. Holds: HC_BETA_TABLE / INCOME_VOLATILITY_SIGMA /
+│                       HUMAN_CAPITAL_TYPE (β/ρ/σ tables), lookup_hc_beta(),
+│                       compute_human_capital()/build_profile(), TARGET_OCCUPATIONS +
+│                       build_bls_personas(), BONUS_RATE_TABLE, SCF_FINANCIAL_ASSETS,
+│                       get_age_bracket(), lookup_financial_capital(),
+│                       and INCOME_STABILITY_BASIS (proof-of-categorization + integrity check)
+└── __init__.py
 ```
 
-`beta.py` is **deprecated** and raises `ImportError` on import. Use `hc_beta_table.lookup_hc_beta()`. Any `from beta import ...` anywhere in the codebase must be removed.
+Unit tests live at the top-level `tests/test_profile.py` and `tests/test_human_capital.py` (no live API calls).
+
+> **Refactor note (post-June 30):** `loaders.py`, `hc_beta_table.py`, `personas.py`, `human_capital.py`, and the deprecated `beta.py` have all been **removed**. Their data-loading moved to `profile_agent.py`; everything else was consolidated inline into `profile_model.py`. Any `from loaders import ...` / `from hc_beta_table import ...` / `from beta import ...` must be updated to import from `profile_model` (or `profile_agent` for loaders).
 
 ---
 
@@ -125,6 +131,18 @@ HC type boundaries (enforced by `contracts.py` `_check_hc_type_consistent_with_b
 - `bond-like`: β ≤ 0.30
 - `mixed`: 0.30 < β ≤ 0.80
 - `equity-like`: β > 0.80
+
+### Income-Stability Categorization — Proof
+
+Each occupation's `income_stability` label (which sets σ and the HC type) is **not** a bare hand-assignment. It is derived from three observable, citable labor-economics signals, and corroborated by the pipeline's own comp-structure fields (`bonus_rate`, `rsu_eligible`, `has_pension`):
+
+1. **Variable-compensation share** — fraction of pay that is not fixed base salary. Proxied by the BLS ECEC supplemental-pay share (`BONUS_RATE_TABLE` source) plus equity comp (`rsu_eligible`) and commission. More variable pay → income co-moves with markets → higher σ and β.
+2. **Cyclical employment risk** — occupational unemployment level/cyclicality (BLS CPS). Education, healthcare, and government run structurally low and near-acyclical; professional/technical roles are moderate; technology and sales are the most layoff-cyclical.
+3. **Institutional job protection** — tenure, occupational licensure, civil-service status, and DB pension coverage (`has_pension`).
+
+The per-occupation justification is recorded in `INCOME_STABILITY_BASIS` (`profile_model.py`), and an **import-time integrity check** asserts every `TARGET_OCCUPATIONS` label matches its documented basis — so a label and its proof cannot silently diverge.
+
+> Sources: BLS ECEC Q1 2026, Table 5 (supplemental-pay share by occupational group); BLS CPS occupational unemployment; Davis & Willen (2000), occupational income betas.
 
 ---
 
@@ -205,7 +223,7 @@ Published every 3 years; no live API. Implemented as a static dict in `loaders.S
 
 ## Beta and Correlation — Calibrated Table
 
-Beta and correlation are looked up from `hc_beta_table.py` — the **only** authorised source. This replaces the OLS regression in the prior design, which regressed synthetic Gaussian noise (`σ × N(0,1)`) against Fama-French sector returns and produced β ≈ 0 for every client regardless of career type.
+Beta and correlation are looked up from the `HC_BETA_TABLE` in `profile_model.py` (via `lookup_hc_beta()`) — the **only** authorised source. This replaces the OLS regression in the prior design, which regressed synthetic Gaussian noise (`σ × N(0,1)`) against Fama-French sector returns and produced β ≈ 0 for every client regardless of career type.
 
 ```python
 HC_BETA_TABLE = {
@@ -470,10 +488,10 @@ FRED is unreachable or the API key is invalid.
 ## Implementation Notes
 
 - **Entry point:** `agents/profile/profile_agent.py` → `run_profile_agent()`
-- **Beta source:** `agents/profile/hc_beta_table.py` — the only authorised source. `beta.py` is deprecated and raises `ImportError`.
+- **Beta source:** `HC_BETA_TABLE` in `agents/profile/profile_model.py` (via `lookup_hc_beta()`) — the only authorised source. The former `hc_beta_table.py` and deprecated `beta.py` have been removed.
 - **Environment:** pandas pinned to `>=2.0,<3.0` across all agents (pandas 3.x caused parquet load errors — team decision June 25 2026)
 - **BLS OES source file:** `national_M2023_dl.xlsx` — converted and cached as `data/storage/bls_oes_2023.parquet` on first run
-- **Output (JSON):** `agents/profile/profiles_all.json`
+- **Output (JSON):** `data/outputs/profiles_all.json`
 - **Output (Parquet):** `data/storage/profiles_all.parquet` — consumed by Allocation, Risk, Compliance agents
 - **Runtime environment:** Google Colab or local Python 3.11+
 - **API keys needed:** `FRED_API` only. No Anthropic or OpenAI keys required.

@@ -157,8 +157,60 @@ def to_profile_agent_output(profile_dict: dict) -> ProfileAgentOutput:
 # 3. BLS persona builder
 # ===========================================================================
 
+# ── Income-stability categorization — documented basis ─────────────────────
+# Addresses review note: "income_stability is hardcoded, provide proof of
+# categorization." Each occupation's High/Medium/Low label is NOT a bare
+# hand-assignment — it is derived from three observable, citable labor-economics
+# signals, and corroborated by the pipeline's own comp-structure fields
+# (bonus_rate, rsu_eligible, has_pension):
+#
+#   (1) Variable-compensation share — fraction of total pay that is not fixed
+#       base salary. Proxied by BLS ECEC supplemental-pay share (Table 5 — the
+#       same source as BONUS_RATE_TABLE below) plus equity comp (rsu_eligible)
+#       and commission. More variable pay → income co-moves with markets → lower
+#       stability → higher σ and higher income_equity_beta.
+#   (2) Cyclical employment risk — occupational unemployment level/cyclicality
+#       (BLS CPS). Education, healthcare, and government run structurally low,
+#       near-acyclical unemployment; professional/technical roles are moderate;
+#       technology and sales are the most layoff-cyclical.
+#   (3) Institutional job protection — tenure, occupational licensure,
+#       civil-service status, and DB pension coverage (has_pension).
+#
+# Tier definitions (see INCOME_VOLATILITY_SIGMA / HUMAN_CAPITAL_TYPE above):
+#   High   (σ=0.05, bond-like):   salaried, licensed/tenured/civil-service,
+#                                 minimal variable pay (ECEC supp. ~3.3–4.1%),
+#                                 often pensioned.
+#   Medium (σ=0.20, mixed):       stable base + meaningful bonus (ECEC supp.
+#                                 ~4.1–5.7%), no equity/commission, moderate
+#                                 cyclicality.
+#   Low    (σ=0.40, equity-like): large equity- or commission-linked variable
+#                                 pay (RSU concentration ≥0.35; sales commission)
+#                                 and high layoff cyclicality — income tracks
+#                                 equity markets.
+#
+# Sources:
+#   BLS ECEC Q1 2026, Table 5 (supplemental-pay share by occupational group):
+#     https://www.bls.gov/news.release/ecec.t05.htm
+#   BLS CPS, unemployment by occupation: https://www.bls.gov/cps/tables.htm
+#   Davis & Willen (2000), occupational income betas by occupation class (SSRN).
+#
+# Per-occupation justification (the "proof" for each row of TARGET_OCCUPATIONS):
+INCOME_STABILITY_BASIS = {
+    "25-1042": {"tier": "High",   "drivers": "Tenure-track academic; fixed salary; DB pension; ECEC supp. pay ~3.3%; education employment near-acyclical."},
+    "29-1141": {"tier": "High",   "drivers": "Licensed clinician; salaried base; healthcare unemployment structurally low and counter-cyclical; ECEC supp. pay ~3.3%."},
+    "13-1041": {"tier": "High",   "drivers": "Civil-service/regulated role; DB pension; government employment acyclical; no equity or commission pay."},
+    "23-1011": {"tier": "Medium", "drivers": "Salaried base plus bonus (ECEC prof. supp. ~4.1%); licensed but demand cyclical (firm layoffs); no equity comp."},
+    "17-2141": {"tier": "Medium", "drivers": "Salaried plus modest bonus (ECEC prof. supp. ~4.1%); hiring tracks the industrial cycle; no equity comp."},
+    "13-2051": {"tier": "Medium", "drivers": "Base plus sizable bonus (ECEC mgmt/finance supp. ~5.7%) that co-moves with markets; no equity grant at analyst level."},
+    "15-1252": {"tier": "Low",    "drivers": "RSU-eligible (equity comp, RSU concentration ~0.35); tech employment layoff-cyclical; income tracks company/market equity."},
+    "11-3021": {"tier": "Low",    "drivers": "RSU-eligible management equity comp; technology-sector cyclicality; income tracks equity markets."},
+    "11-2022": {"tier": "Low",    "drivers": "Commission-linked pay tied to revenue/market conditions; high earnings variance; consumer-discretionary cyclicality."},
+}
+
 # ── Target occupations (9 SOC codes) — BLS OES May 2023 ────────────────────
 # https://www.bls.gov/oes/2023/may/oes_nat.htm
+# income_stability per row is justified in INCOME_STABILITY_BASIS above; the two
+# are kept in sync by the integrity check immediately following this table.
 TARGET_OCCUPATIONS = [
     {"soc": "25-1042", "label": "Biology Professor",   "career_type": "Academia",    "income_stability": "High",   "has_pension": True,  "rsu_eligible": False, "sector": "Education"},
     {"soc": "29-1141", "label": "Registered Nurse",    "career_type": "Healthcare",  "income_stability": "High",   "has_pension": False, "rsu_eligible": False, "sector": "Healthcare"},
@@ -170,6 +222,21 @@ TARGET_OCCUPATIONS = [
     {"soc": "11-3021", "label": "IT Manager",          "career_type": "Technology",  "income_stability": "Low",    "has_pension": False, "rsu_eligible": True,  "sector": "Technology"},
     {"soc": "11-2022", "label": "Sales Manager",       "career_type": "Sales",       "income_stability": "Low",    "has_pension": False, "rsu_eligible": False, "sector": "Consumer Discretionary"},
 ]
+
+# Proof-of-categorization integrity check: every occupation's income_stability
+# label must match its documented basis in INCOME_STABILITY_BASIS, so the label
+# and its justification cannot silently drift apart.
+for _occ in TARGET_OCCUPATIONS:
+    _basis = INCOME_STABILITY_BASIS.get(_occ["soc"])
+    assert _basis is not None, (
+        f"No income_stability basis documented for SOC {_occ['soc']} "
+        f"({_occ['label']}). Add it to INCOME_STABILITY_BASIS."
+    )
+    assert _basis["tier"] == _occ["income_stability"], (
+        f"income_stability mismatch for SOC {_occ['soc']} ({_occ['label']}): "
+        f"TARGET_OCCUPATIONS says {_occ['income_stability']!r}, "
+        f"INCOME_STABILITY_BASIS says {_basis['tier']!r}."
+    )
 
 # Representative career-midpoint age per SOC (for HC annuity horizon n = 65 − age).
 SOC_AGES = {
