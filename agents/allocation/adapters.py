@@ -121,14 +121,20 @@ def profile_to_allocation_input(
         employer_sector     = profile.industry_exposure_sector,
         income_volatility   = profile.income_volatility_sigma,
         income_beta         = profile.income_equity_beta,
+        human_capital_type  = profile.human_capital_type.value,
         years_to_retirement = profile.investment_horizon_years,
         discount_rate       = discount_rate,
     )
 
+    equity_target = profile.portfolio_equity_target
+    if equity_target is None:
+        equity_target = profile.effective_risk_budget - profile.implicit_equity_exposure
+
     user_profile = UserProfile(
-        financial_wealth = profile.financial_capital,
-        human_capital    = hc,
-        risk_profile     = RiskProfile(profile.risk_tolerance_level.value),
+        financial_wealth        = profile.financial_capital,
+        human_capital           = hc,
+        risk_profile            = RiskProfile(profile.risk_tolerance_level.value),
+        portfolio_equity_target = equity_target,
     )
 
     # Use CRSP market cap weights; fall back to equal weight for any missing tickers

@@ -246,6 +246,12 @@ def run_allocation(
     alpha       = merton_risky_share(port_excess, port_vol, up.risk_profile)
     w_fin       = compute_w_fin(alpha, hc.present_value, up.financial_wealth, hc.income_beta)
 
+    # Cap the HC-adjusted risky weight at the Profile Agent's equity target so
+    # total (career + portfolio) equity exposure never exceeds the client's
+    # risk budget. Negative targets (career already exceeds budget) force w_fin to 0.
+    equity_cap = float(np.clip(up.portfolio_equity_target, 0.0, 1.0))
+    w_fin      = min(w_fin, equity_cap)
+
     decomposition = [
         WeightDecomposition(
             ticker=t,

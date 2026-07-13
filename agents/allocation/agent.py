@@ -52,12 +52,14 @@ def _build_rationale_prompt(inp: AllocationInput, out: AllocationOutput) -> str:
         "You are a quantitative portfolio analyst writing a client-facing rationale.",
         "",
         "CLIENT PROFILE",
-        f"  Financial wealth:    ${up.financial_wealth:>12,.0f}",
-        f"  Human capital (PV): ${hc.present_value:>12,.0f}",
-        f"  Risk profile:        {up.risk_profile.value}",
-        f"  Years to retirement: {hc.years_to_retirement}",
-        f"  Employer sector:     {hc.employer_sector}",
-        f"  Income beta:         {hc.income_beta:.2f}",
+        f"  Financial wealth:        ${up.financial_wealth:>12,.0f}",
+        f"  Human capital (PV):      ${hc.present_value:>12,.0f}",
+        f"  Risk profile:            {up.risk_profile.value}",
+        f"  Years to retirement:     {hc.years_to_retirement}",
+        f"  Employer sector:         {hc.employer_sector}",
+        f"  Income beta:             {hc.income_beta:.2f}",
+        f"  Human capital type:      {hc.human_capital_type}",
+        f"  Portfolio equity target: {up.portfolio_equity_target:.1%}  (risk budget minus implicit equity exposure; caps the risky weight)",
         "",
         "PORTFOLIO DECISION",
         f"  Risky weight:    {out.risky_weight:.1%} of financial wealth",
@@ -80,11 +82,12 @@ def _build_rationale_prompt(inp: AllocationInput, out: AllocationOutput) -> str:
         f"  Momentum:    {fe.mom:.2f}",
         "",
         "Write a 4-sentence rationale covering:",
-        "1. Why the risky/safe split is appropriate given the human capital profile.",
+        "1. Why the risky/safe split is appropriate given the human capital type and profile.",
         "2. Which factor views drove the largest tilts away from market-cap weights.",
         "3. Key risk characteristics (volatility, Sharpe, factor exposures).",
         "4. Any notable concentration or sector bets and their justification.",
-        "Reference the client's income beta, HC present value, and at least two specific tickers.",
+        "Reference the client's HC type, income beta, portfolio equity target, HC present value, "
+        "and at least two specific tickers.",
         "Be precise with numbers. Do not invent figures not shown above.",
     ]
     return "\n".join(lines)
@@ -154,10 +157,13 @@ def run_allocation_agent(
     if _client is None:
         top = sorted(raw_output.weights, key=lambda w: w.total_weight, reverse=True)[:3]
         top_str = ", ".join(f"{w.ticker} {w.total_weight:.1%}" for w in top)
+        up = allocation_input.user_profile
         rationale = (
             f"[No API key — template rationale] "
             f"Risky weight {raw_output.risky_weight:.1%} based on BMS human capital model "
-            f"(income beta {allocation_input.user_profile.human_capital.income_beta:.2f}). "
+            f"(income beta {up.human_capital.income_beta:.2f}, "
+            f"human capital type '{up.human_capital.human_capital_type}', "
+            f"capped at portfolio equity target {up.portfolio_equity_target:.1%}). "
             f"Top holdings: {top_str}. "
             f"Expected return {raw_output.portfolio_statistics.expected_return:.2%}, "
             f"volatility {raw_output.portfolio_statistics.volatility:.2%}, "

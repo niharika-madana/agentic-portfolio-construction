@@ -356,10 +356,12 @@ class AllocationAgentOutput(BaseModel):
     """
     Portfolio recommendation from the Allocation Agent.
 
-    The core allocation logic uses implicit_equity_exposure from the
-    profile to compute the portfolio equity target:
-
-        portfolio_risky_share = effective_risk_budget − implicit_equity_exposure
+    The core allocation logic computes the risky weight via the Merton/
+    Campbell-Viceira HC-adjusted formula (compute_w_fin, driven by
+    income_equity_beta), then caps it at portfolio_equity_target
+    (= effective_risk_budget − implicit_equity_exposure) from the profile,
+    so the total (career + portfolio) equity exposure never exceeds the
+    client's risk budget.
 
     This is what produces meaningfully different allocations for each
     persona: the tech exec's high implicit_equity_exposure (≈0.90) leaves
@@ -407,15 +409,26 @@ class HumanCapitalInput(BaseModel):
     employer_sector:      str   = Field(description="GICS sector of employer")
     income_volatility:    float = Field(..., ge=0, description="Annualised std dev of earnings shocks (σ)")
     income_beta:          float = Field(description="β of income to equity market")
+    human_capital_type:   str   = Field(description="'bond-like' | 'mixed' | 'equity-like' — qualitative label derived from income_beta")
     years_to_retirement:  int   = Field(..., gt=0)
     discount_rate:        float = Field(..., gt=0, description="FRED DGS10 rate used to discount HC")
 
 
 class UserProfile(BaseModel):
     """Internal user profile consumed by Allocation / Risk core modules."""
-    financial_wealth: float          = Field(..., gt=0, description="Total investable financial wealth (W)")
-    human_capital:    HumanCapitalInput
-    risk_profile:     RiskProfile
+    financial_wealth:        float          = Field(..., gt=0, description="Total investable financial wealth (W)")
+    human_capital:           HumanCapitalInput
+    risk_profile:            RiskProfile
+    portfolio_equity_target: float          = Field(
+        description=(
+            "effective_risk_budget − implicit_equity_exposure, computed by the Profile Agent. "
+            "The residual equity capacity the Allocation Agent must respect: the optimizer's "
+            "HC-adjusted risky weight (see compute_w_fin) is capped at this value so total "
+            "(career + portfolio) equity exposure never exceeds the client's risk budget. "
+            "Can be negative when the career alone already exceeds the budget, forcing the "
+            "risky weight toward 0."
+        )
+    )
 
 
 class InstrumentUniverse(BaseModel):
