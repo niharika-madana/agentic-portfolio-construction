@@ -122,6 +122,7 @@ def profile_to_allocation_input(
         income_volatility   = profile.income_volatility_sigma,
         income_beta         = profile.income_equity_beta,
         human_capital_type  = profile.human_capital_type.value,
+        rsu_concentration   = profile.RSU_concentration,
         years_to_retirement = profile.investment_horizon_years,
         discount_rate       = discount_rate,
     )

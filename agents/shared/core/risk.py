@@ -81,9 +81,21 @@ def _build_daily_matrix(
 
 
 def _apply_mask(weights: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Restrict portfolio-level weights (summing to risky_weight, not 1.0 — the
+    remainder sits in the safe/cash sleeve) to tickers with available return
+    data, redistributing proportionally so the surviving tickers still total
+    the intended risky allocation. A risky_weight of 0 (all cash) correctly
+    returns an all-zero vector instead of equal-weighting the universe.
+    """
+    intended_total = float(weights.sum())
     w = weights[mask]
-    total = w.sum()
-    return w / total if total > 0 else np.full(w.shape, 1.0 / len(w))
+    if intended_total <= 0:
+        return np.zeros_like(w)
+    available_total = float(w.sum())
+    if available_total <= 0:
+        return np.full(w.shape, intended_total / len(w)) if len(w) > 0 else w
+    return w * (intended_total / available_total)
 
 
 # ── VaR and CVaR ─────────────────────────────────────────────────────────────
@@ -137,7 +149,9 @@ def compute_liquidity_score(
     max_log    = log_vol.max()
     normalised = log_vol / max_log if max_log > 0 else np.zeros_like(log_vol)
     total = weights.sum()
-    w_norm = weights / total if total > 0 else weights
+    if total <= 0:
+        return 1.0  # all cash — maximally liquid, not zero
+    w_norm = weights / total
     return float(w_norm @ normalised)
 
 
@@ -326,7 +340,7 @@ def make_decision(
     violations: list[AllocationConstraint],
     max_drawdown: float,
     stress_results: list[StressResult],
-    hc_adjusted: HumanCapitalAdjustedMetrics,
+    idiosyncratic_employer_exposure: float,
     risk_profile: RiskProfile,
     effective_risk_profile: RiskProfile,
     regime: MarketRegime,
@@ -338,13 +352,19 @@ def make_decision(
     Deterministic APPROVE / FLAG / REJECT decision.
 
     REJECT conditions (structurally unfixable):
-      - hc_fraction > EMPLOYER_LIMIT: HC alone breaches employer limit
+      - idiosyncratic_employer_exposure > EMPLOYER_LIMIT even at zero employer
+        stock in the portfolio: the client's genuinely employer-specific risk
+        (employer stock + _EMPLOYER_HC_SHOCK share of HC) alone breaches the
+        limit, so no reallocation can fix it
       - CRITICAL stress while already at CONSERVATIVE: no further downgrade possible
       - flag_iteration >= 2 with real violations remaining
 
     FLAG conditions (fed back to Allocation as tighter constraints):
       - Concentration violations        → per-ticker tighter bounds
-      - Max drawdown exceeds cap        → proportional single-name tightening
+      - Max drawdown exceeds cap        → proportional single-name tightening,
+                                           plus RISK_PROFILE_DOWNGRADE one step
+                                           (single-name tightening alone cannot
+                                           cure a broad-market-beta drawdown)
       - CRITICAL stress                 → RISK_PROFILE_DOWNGRADE one step
 
     Smart convergence: at flag_iteration >= 2, only real violations (drawdown
@@ -354,9 +374,10 @@ def make_decision(
     cap             = effective_cap(effective_risk_profile, regime)
     drawdown_breach = max_drawdown > cap
     critical_stress = any(r.severity == StressSeverity.CRITICAL for r in stress_results)
+    needs_downgrade = drawdown_breach or critical_stress
 
     # ── Hard structural REJECTs ──
-    if hc_adjusted.hc_fraction > EMPLOYER_LIMIT:
+    if idiosyncratic_employer_exposure > EMPLOYER_LIMIT:
         return RiskDecision.REJECT, []
 
     if critical_stress and effective_risk_profile == RiskProfile.CONSERVATIVE:
@@ -368,12 +389,12 @@ def make_decision(
     if drawdown_breach:
         flag_constraints += _drawdown_flag_constraints(tickers, weights, max_drawdown, cap)
 
-    if critical_stress:
+    if needs_downgrade:
         flag_constraints += _stress_flag_constraints(effective_risk_profile)
 
     # Carry an existing profile downgrade forward so it survives subsequent FLAG
     # iterations that may only generate other constraint types (e.g. drawdown).
-    if effective_risk_profile != risk_profile and not critical_stress:
+    if effective_risk_profile != risk_profile and not needs_downgrade:
         flag_constraints.append(AllocationConstraint(
             constraint_type=ConstraintType.RISK_PROFILE_DOWNGRADE,
             target=effective_risk_profile.value,
@@ -474,25 +495,39 @@ def run_risk(
         hc.income_beta, hc.employer_sector, hc.employer_ticker,
     )
 
+    # employer_concentration() (human_capital.py) attributes 100% of HC to the
+    # employer — a deliberately conservative worst-case number kept as-is for
+    # HumanCapitalAdjustedMetrics reporting/audit. For the pass/fail gate below,
+    # only rsu_concentration's share of HC is idiosyncratically tied to this
+    # one employer (RSUs/equity comp mean job and portfolio both ride on the
+    # same company); the rest is ordinary, diversifiable-across-employers
+    # career risk already priced in via income_beta / portfolio_equity_target.
+    # A salaried client with zero equity comp (rsu_concentration=0) correctly
+    # contributes ~0 idiosyncratic employer risk from HC alone.
+    tw = total_wealth(up.financial_wealth, hc.present_value)
+    idiosyncratic_employer_exposure = (
+        employer_fin_weight * up.financial_wealth + hc.present_value * hc.rsu_concentration
+    ) / tw
+
     flags      = run_all_checks(weight_dict, universe.sectors,
                                 hc_adj.economic_sector_exposures,
-                                hc_adj.employer_concentration)
+                                idiosyncratic_employer_exposure)
     violations = all_violations(weight_dict, universe.sectors,
                                 hc_adj.economic_sector_exposures,
-                                hc_adj.employer_concentration)
+                                idiosyncratic_employer_exposure)
 
     decision, flag_constraints = make_decision(
-        concentration_flags    = flags,
-        violations             = violations,
-        max_drawdown           = mdd,
-        stress_results         = stress_results,
-        hc_adjusted            = hc_adj,
-        risk_profile           = up.risk_profile,
-        effective_risk_profile = effective_profile,
-        regime                 = regime,
-        flag_iteration         = ai.flag_iteration,
-        tickers                = tickers,
-        weights                = weights,
+        concentration_flags              = flags,
+        violations                       = violations,
+        max_drawdown                     = mdd,
+        stress_results                   = stress_results,
+        idiosyncratic_employer_exposure  = idiosyncratic_employer_exposure,
+        risk_profile                     = up.risk_profile,
+        effective_risk_profile           = effective_profile,
+        regime                           = regime,
+        flag_iteration                   = ai.flag_iteration,
+        tickers                          = tickers,
+        weights                          = weights,
     )
 
     risk_metrics = RiskMetrics(

@@ -6,7 +6,7 @@ from scipy.optimize import minimize, Bounds
 
 from contracts import (
     AllocationConstraint, AllocationInput, AllocationOutput,
-    ConstraintType, FactorExposures, PortfolioStatistics, WeightDecomposition,
+    ConstraintType, FactorExposures, PortfolioStatistics, RiskProfile, WeightDecomposition,
 )
 from agents.shared.core.constraints import SINGLE_NAME_LIMIT, SECTOR_LIMIT
 from agents.shared.core.human_capital import compute_w_fin, merton_risky_share
@@ -241,9 +241,19 @@ def run_allocation(
     w_BL  = optimize_weights(mu_BL, Sigma_BL, **opt_kwargs)
     w_BL_base = optimize_weights(mu_BL, Sigma_BL, tickers=tickers, sectors=universe.sectors, flag_constraints=[])
 
+    # A prior FLAG iteration may have downgraded the effective risk profile
+    # (RISK_PROFILE_DOWNGRADE). Risk Agent tightens its drawdown cap based on
+    # this same effective profile (see run_risk's effective_profile) — the
+    # downgrade must also lower alpha here, or the cap gets stricter while the
+    # risky weight stays the same, making the breach worse instead of better.
+    effective_risk_profile = up.risk_profile
+    for fc in allocation_input.flag_constraints:
+        if fc.constraint_type == ConstraintType.RISK_PROFILE_DOWNGRADE:
+            effective_risk_profile = RiskProfile(fc.target)
+
     port_vol    = float(np.sqrt(w_BL @ cov @ w_BL))
     port_excess = float(w_BL @ mu_BL)
-    alpha       = merton_risky_share(port_excess, port_vol, up.risk_profile)
+    alpha       = merton_risky_share(port_excess, port_vol, effective_risk_profile)
     w_fin       = compute_w_fin(alpha, hc.present_value, up.financial_wealth, hc.income_beta)
 
     # Cap the HC-adjusted risky weight at the Profile Agent's equity target so
@@ -263,10 +273,21 @@ def run_allocation(
         for i, t in enumerate(tickers)
     ]
 
-    exp_ret = float(w_BL @ mu_BL) + risk_free_rate
-    vol     = float(np.sqrt(w_BL @ cov @ w_BL))
+    # WeightDecomposition/proposed_portfolio stay sleeve-relative (sum to 1.0,
+    # validated by AllocationOutput/AllocationAgentOutput); risky_weight is
+    # reported separately. portfolio_statistics, however, must describe the
+    # whole portfolio, so it blends the risky sleeve with a zero-vol,
+    # risk-free-return safe sleeve, weighted by w_fin/(1 - w_fin).
+    exp_ret = risk_free_rate + w_fin * port_excess
+    vol     = w_fin * port_vol
     sharpe  = (exp_ret - risk_free_rate) / vol if vol > 0 else 0.0
-    fe      = compute_factor_exposures(w_BL, excess, ff_arr)
+    fe_risky = compute_factor_exposures(w_BL, excess, ff_arr)
+    fe = FactorExposures(
+        market_beta = w_fin * fe_risky.market_beta,
+        smb         = w_fin * fe_risky.smb,
+        hml         = w_fin * fe_risky.hml,
+        mom         = w_fin * fe_risky.mom,
+    )
 
     return AllocationOutput(
         allocation_input=allocation_input,

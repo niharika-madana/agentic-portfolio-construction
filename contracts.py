@@ -410,6 +410,7 @@ class HumanCapitalInput(BaseModel):
     income_volatility:    float = Field(..., ge=0, description="Annualised std dev of earnings shocks (σ)")
     income_beta:          float = Field(description="β of income to equity market")
     human_capital_type:   str   = Field(description="'bond-like' | 'mixed' | 'equity-like' — qualitative label derived from income_beta")
+    rsu_concentration:    float = Field(default=0.0, ge=0, le=1, description="Fraction of financial holdings in employer RSUs; scales how much of HC is idiosyncratically tied to this one employer vs. diversifiable sector/market risk")
     years_to_retirement:  int   = Field(..., gt=0)
     discount_rate:        float = Field(..., gt=0, description="FRED DGS10 rate used to discount HC")
 
