@@ -22,6 +22,10 @@ Coverage (maps to 30JUN_ProfileAgent_Design.md §Unit Tests):
     9.  contract validator fires when β disagrees with human_capital_type
     10. contract validator fires when current_holdings do not sum to 1.0
     11. to_profile_agent_output — round-trip returns a ProfileAgentOutput
+    12. every occupation has a matching documented income-stability basis
+    13. no orphaned INCOME_STABILITY_BASIS entries
+    14. tier_derivation reproduces every declared tier
+    15. every tier_derivation override is load-bearing
 
 Run with: pytest agents/profile/test_profile.py -v
 """
@@ -32,12 +36,15 @@ from pydantic import ValidationError
 from contracts import ProfileAgentOutput
 
 from agents.profile.profile_model import (
+    INCOME_STABILITY_BASIS,
     INCOME_VOLATILITY_SIGMA,
+    TARGET_OCCUPATIONS,
     lookup_hc_beta,
     build_profile,
     compute_human_capital,
     to_profile_agent_output,
 )
+from agents.profile.tier_derivation import OVERRIDES, derive_all
 
 DISCOUNT_RATE = 0.044  # fixed for tests — no FRED call needed
 
@@ -265,3 +272,62 @@ def test_to_profile_agent_output_round_trip(software_developer):
     assert output.income_equity_beta == profile["income_equity_beta"]
     assert output.implicit_equity_exposure == profile["implicit_equity_exposure"]
     assert output.human_capital_type.value == profile["human_capital_type"]
+
+
+# ---------------------------------------------------------------------------
+# 12-15. Income-stability tier: proof of categorization
+# ---------------------------------------------------------------------------
+# profile_model.py runs an import-time integrity check over these same two
+# tables, but bare asserts are stripped under `python -O`, so the check silently
+# disappears in an optimized run. These tests pin the invariant unconditionally.
+
+def test_every_occupation_has_a_matching_documented_basis():
+    for occ in TARGET_OCCUPATIONS:
+        basis = INCOME_STABILITY_BASIS.get(occ["soc"])
+        assert basis is not None, f"No documented basis for SOC {occ['soc']} ({occ['label']})."
+        assert basis["tier"] == occ["income_stability"], (
+            f"{occ['label']}: TARGET_OCCUPATIONS says {occ['income_stability']!r}, "
+            f"INCOME_STABILITY_BASIS says {basis['tier']!r}."
+        )
+        assert basis["drivers"].strip(), f"Empty justification for SOC {occ['soc']}."
+
+
+def test_no_orphaned_basis_entries():
+    documented = set(INCOME_STABILITY_BASIS)
+    declared   = {occ["soc"] for occ in TARGET_OCCUPATIONS}
+    assert documented == declared, (
+        f"INCOME_STABILITY_BASIS and TARGET_OCCUPATIONS disagree on which "
+        f"occupations exist. Only in basis: {documented - declared}. "
+        f"Only in occupations: {declared - documented}."
+    )
+
+
+def test_derivation_reproduces_every_declared_tier():
+    """The scoring rule, plus its documented overrides, recovers every label."""
+    for row in derive_all():
+        declared = INCOME_STABILITY_BASIS[row["soc"]]["tier"]
+        assert row["tier"] == declared, (
+            f"{row['label']}: derivation produced {row['tier']!r} but "
+            f"INCOME_STABILITY_BASIS declares {declared!r} "
+            f"(score={row['score']}, rule_tier={row['rule_tier']!r})."
+        )
+
+
+def test_every_override_is_load_bearing():
+    """An override may only exist where the scoring rule genuinely disagrees.
+
+    Without this, OVERRIDES becomes a place to park rows the rule cannot explain,
+    and the derivation stops being proof of anything.
+    """
+    for row in derive_all():
+        if row["overridden"]:
+            assert row["rule_tier"] != row["tier"], (
+                f"{row['label']} is listed in OVERRIDES but the scoring rule "
+                f"already yields {row['rule_tier']!r}. Remove the override."
+            )
+            assert row["reason"], f"Override for {row['label']} states no reason."
+
+    assert set(OVERRIDES) <= {occ["soc"] for occ in TARGET_OCCUPATIONS}, (
+        f"OVERRIDES names SOC codes absent from TARGET_OCCUPATIONS: "
+        f"{set(OVERRIDES) - {occ['soc'] for occ in TARGET_OCCUPATIONS}}"
+    )
