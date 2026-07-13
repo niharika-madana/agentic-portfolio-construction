@@ -63,7 +63,7 @@ _CLIENT_CONTEXT_TERMS: set[str] = {
 _SUITABILITY_VOL_BANDS: dict[str, tuple[float, float]] = {
     "conservative": (0.00, 0.12),
     "moderate":     (0.00, 0.20),
-    "aggressive":   (0.00, 0.30),
+    "aggressive":   (0.08, 0.30),
 }
 
 

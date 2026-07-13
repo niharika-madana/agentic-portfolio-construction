@@ -233,7 +233,7 @@ def check_consistency(
                 severity          = Severity.HIGH,
                 description       = (
                     f"Regime '{regime}': portfolio_drawdown {ev.portfolio_drawdown:.2%} "
-                    f"< drawdown_floor {ev.drawdown_floor:.2%} (worse than floor) "
+                    f"> drawdown_floor {ev.drawdown_floor:.2%} (worse than floor) "
                     f"but Risk Agent marked passed=True."
                 ),
                 rule_reference    = "Internal Risk Agent consistency — benchmark-relative drawdown evaluation",

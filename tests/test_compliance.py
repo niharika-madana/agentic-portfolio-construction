@@ -194,19 +194,19 @@ def _make_risk_output(
     )
     sector_limits = {} if skip_employer_sector_limit else {"technology": tech_sector}
 
-    # Build regime evaluation
+    # Build regime evaluation — positive loss fractions (larger = more loss = worse)
     regime_evaluation = {
-        "dot_com":   RegimeEvaluation(benchmark_drawdown=-0.44, drawdown_floor=-0.44, portfolio_drawdown=-0.50, passed=False),
-        "gfc":       RegimeEvaluation(benchmark_drawdown=-0.51, drawdown_floor=-0.51, portfolio_drawdown=-0.45, passed=True),
-        "covid":     RegimeEvaluation(benchmark_drawdown=-0.34, drawdown_floor=-0.34, portfolio_drawdown=-0.30, passed=True),
-        "rate_hike": RegimeEvaluation(benchmark_drawdown=-0.22, drawdown_floor=-0.22, portfolio_drawdown=-0.18, passed=True),
-        "ai_boom":   RegimeEvaluation(benchmark_drawdown=-0.12, drawdown_floor=-0.12, portfolio_drawdown=-0.08, passed=True),
+        "Late-Cycle Expansion":   RegimeEvaluation(benchmark_drawdown=0.44, drawdown_floor=0.44, portfolio_drawdown=0.50, passed=False),
+        "Financial Crisis & ZLB": RegimeEvaluation(benchmark_drawdown=0.51, drawdown_floor=0.51, portfolio_drawdown=0.45, passed=True),
+        "Early Recovery":         RegimeEvaluation(benchmark_drawdown=0.34, drawdown_floor=0.34, portfolio_drawdown=0.30, passed=True),
+        "Inflation Shock":        RegimeEvaluation(benchmark_drawdown=0.22, drawdown_floor=0.22, portfolio_drawdown=0.18, passed=True),
+        "Moderate Expansion":     RegimeEvaluation(benchmark_drawdown=0.12, drawdown_floor=0.12, portfolio_drawdown=0.08, passed=True),
     }
     if regime_false_positive:
-        # dot_com: portfolio worse than floor but passed=True
-        regime_evaluation["dot_com"] = RegimeEvaluation(
-            benchmark_drawdown=-0.44, drawdown_floor=-0.44,
-            portfolio_drawdown=-0.60, passed=True
+        # Late-Cycle Expansion: portfolio worse than floor (0.60 > 0.44) but passed=True
+        regime_evaluation["Late-Cycle Expansion"] = RegimeEvaluation(
+            benchmark_drawdown=0.44, drawdown_floor=0.44,
+            portfolio_drawdown=0.60, passed=True
         )
     if drop_regime and drop_regime in regime_evaluation:
         del regime_evaluation[drop_regime]
@@ -216,7 +216,7 @@ def _make_risk_output(
         regime_evaluation  = regime_evaluation,
         position_limits    = position_limits,
         sector_limits      = sector_limits,
-        violations         = ["dot_com drawdown exceeds benchmark floor"],
+        violations         = ["Late-Cycle Expansion drawdown exceeds benchmark floor"],
         derivation         = RiskDerivation(
             drawdown_method      = "benchmark_relative_per_regime",
             concentration_method = "marginal_risk_contribution",
@@ -394,11 +394,11 @@ class TestCheck11Completeness:
 
     def test_missing_regime_flagged(self):
         ci = _make_compliance_input()
-        ro = _make_risk_output(drop_regime="gfc")
+        ro = _make_risk_output(drop_regime="Financial Crisis & ZLB")
         violations, _ = check_completeness(ci, ro)
         checks = [v.check for v in violations]
         assert "check_1_1a_regime_completeness" in checks
-        assert any("gfc" in v.description for v in violations)
+        assert any("Financial Crisis & ZLB" in v.description for v in violations)
 
     def test_missing_position_limit_for_portfolio_ticker(self):
         ci = _make_compliance_input()
@@ -713,10 +713,11 @@ class TestCheck25VolatilitySuitability:
 class TestRunComplianceEndToEnd:
 
     def test_clean_portfolio_passes(self):
-        ci = _make_compliance_input()
+        ci = _make_compliance_input(rsu_concentration=0.0)
         ro = _make_risk_output(
             risk_decision               = RiskDecision.APPROVE,
             portfolio_volatility_annual = 0.15,
+            rsu_concentration           = 0.0,
         )
         result = run_compliance(ci, ro)
         assert result.clearance is True
