@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# BLS xlsx cache (legacy — no longer written, but just in case)
+bls_oes_2023_national.xlsx
+

@@ -1,0 +1,132 @@
+{
+    "portfolio_id": "tech_exec_v1",
+    "risk_decision": "FLAG",
+    "regime_evaluation": {
+        "dot_com": {
+            "benchmark_drawdown": -0.44,
+            "drawdown_floor": -0.44,
+            "portfolio_drawdown": -0.62,
+            "passed": false
+        },
+        "gfc": {
+            "benchmark_drawdown": -0.51,
+            "drawdown_floor": -0.51,
+            "portfolio_drawdown": -0.58,
+            "passed": false
+        },
+        "covid": {
+            "benchmark_drawdown": -0.34,
+            "drawdown_floor": -0.34,
+            "portfolio_drawdown": -0.38,
+            "passed": false
+        },
+        "rate_hike": {
+            "benchmark_drawdown": -0.22,
+            "drawdown_floor": -0.22,
+            "portfolio_drawdown": -0.29,
+            "passed": false
+        },
+        "ai_boom": {
+            "benchmark_drawdown": -0.12,
+            "drawdown_floor": -0.12,
+            "portfolio_drawdown": -0.08,
+            "passed": true
+        }
+    },
+    "position_limits": {
+        "AAPL": {
+            "derived_limit": 0.12,
+            "actual_weight": 0.15,
+            "passed": false,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.28
+        },
+        "QQQ": {
+            "derived_limit": 0.10,
+            "actual_weight": 0.20,
+            "passed": false,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.32
+        },
+        "BND": {
+            "derived_limit": 0.40,
+            "actual_weight": 0.10,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.05
+        },
+        "VTI": {
+            "derived_limit": 0.30,
+            "actual_weight": 0.25,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.15
+        },
+        "NVDA": {
+            "derived_limit": 0.08,
+            "actual_weight": 0.20,
+            "passed": false,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.45
+        },
+        "CASH": {
+            "derived_limit": 0.50,
+            "actual_weight": 0.10,
+            "passed": true,
+            "method": "marginal_risk_contribution",
+            "asset_volatility": 0.01
+        }
+    },
+    "sector_limits": {
+        "technology": {
+            "base_limit": 0.30,
+            "correlation_with_hc": 0.85,
+            "adjusted_limit": 0.05,
+            "actual_sector_weight": 0.55,
+            "passed": false
+        },
+        "broad_market": {
+            "base_limit": 0.30,
+            "correlation_with_hc": 0.60,
+            "adjusted_limit": 0.12,
+            "actual_sector_weight": 0.25,
+            "passed": false
+        },
+        "bonds": {
+            "base_limit": 0.30,
+            "correlation_with_hc": -0.20,
+            "adjusted_limit": 0.36,
+            "actual_sector_weight": 0.10,
+            "passed": true
+        },
+        "cash": {
+            "base_limit": 0.30,
+            "correlation_with_hc": 0.00,
+            "adjusted_limit": 0.30,
+            "actual_sector_weight": 0.10,
+            "passed": true
+        }
+    },
+    "violations": [
+        "AAPL at 15% exceeds derived limit of 12%",
+        "QQQ at 20% exceeds derived limit of 10%",
+        "NVDA at 20% exceeds derived limit of 8%",
+        "Technology sector at 55% exceeds HC-adjusted limit of 5%",
+        "Broad market at 25% exceeds HC-adjusted limit of 12%",
+        "Portfolio drawdown exceeds benchmark floor in 4 of 5 regimes"
+    ],
+    "warnings": [
+        "Bond allocation at 10% is low for equity-like human capital client"
+    ],
+    "derivation": {
+        "drawdown_method": "benchmark_relative_per_regime",
+        "concentration_method": "marginal_risk_contribution",
+        "sector_method": "hc_correlation_adjusted",
+        "benchmark": "80/20 equity/bond",
+        "risk_tolerance": "moderate",
+        "tolerance_multiplier": 1.0,
+        "hc_type": "equity-like",
+        "rsu_concentration": 0.40,
+        "data_source": "CRSP daily returns 2000-2024"
+    }
+}
