@@ -11,7 +11,7 @@ from contracts import (
 )
 from agents.shared.core.constraints import (
     EMPLOYER_LIMIT, ECONOMIC_SECTOR_LIMIT, SINGLE_NAME_LIMIT,
-    run_all_checks, all_violations,
+    run_all_checks, all_violations, aggregate_sector_weights,
 )
 from agents.shared.core.human_capital import (
     total_wealth, hc_fraction as _hc_fraction,
@@ -48,7 +48,6 @@ STRESS_SCENARIOS: list[dict] = [
 ]
 
 _EMPLOYER_STOCK_SHOCK = 0.50
-_EMPLOYER_HC_SHOCK    = 0.30
 VAR_LOOKBACK_DAYS     = 1260
 
 
@@ -223,9 +222,7 @@ def compute_stress_results(
     crsp_daily: pd.DataFrame,
     permno_map: dict[str, int],
     drawdown_cap: float,
-    employer_ticker: str,
-    employer_financial_weight: float,
-    hc_frac: float,
+    idiosyncratic_employer_exposure: float,
 ) -> list[StressResult]:
     """
     Runs all stress scenarios against the regime-adjusted effective cap.
@@ -249,9 +246,12 @@ def compute_stress_results(
             severity           = _severity(loss, drawdown_cap),
         ))
 
-    employer_fin_loss   = employer_financial_weight * _EMPLOYER_STOCK_SHOCK
-    employer_hc_loss    = hc_frac * _EMPLOYER_HC_SHOCK
-    total_employer_loss = employer_fin_loss + employer_hc_loss
+    # idiosyncratic_employer_exposure is already the correctly-scaled fraction
+    # of total wealth tied to this one employer (actual stock held + real RSU
+    # value, against financial wealth — not raw HC). Apply a single
+    # stock-crash severity to it rather than blending two separately
+    # (mis-)calibrated terms.
+    total_employer_loss = idiosyncratic_employer_exposure * _EMPLOYER_STOCK_SHOCK
     results.append(StressResult(
         scenario           = "Idiosyncratic Employer Shock",
         portfolio_loss     = float(np.clip(total_employer_loss, 0.0, 1.0)),
@@ -319,20 +319,67 @@ def _stress_flag_constraints(
 def _drawdown_flag_constraints(
     tickers: list[str],
     weights: np.ndarray,
+    risky_weight: float,
     current_mdd: float,
     cap: float,
 ) -> list[AllocationConstraint]:
-    reduction = cap / current_mdd
+    """
+    Tighten single-name bounds only for the overweight tickers actually
+    driving the drawdown breach, not every held ticker — tightening every
+    position proportionally can push the sum of bounds below 1.0, making
+    optimize_weights' sum-to-1 sleeve constraint infeasible (see the
+    proportional fallback in optimize_weights). `weights` is portfolio-scale
+    (sleeve_weight * risky_weight); optimize_weights bounds sleeve-relative
+    weights (sum to 1.0), so convert back before comparing to
+    SINGLE_NAME_LIMIT / fair_share.
+    """
+    if risky_weight <= 0:
+        return []
+    sleeve_weights = weights / risky_weight
+    held = sleeve_weights > 0
+    if not held.any():
+        return []
+    fair_share = 1.0 / int(held.sum())
+    floor      = min(fair_share, SINGLE_NAME_LIMIT)
+    reduction  = cap / current_mdd
+    overweight = held & (sleeve_weights > fair_share)
     return [
         AllocationConstraint(
             constraint_type=ConstraintType.SINGLE_NAME,
             target=t,
-            current_value=float(weights[i]),
-            limit=float(np.clip(weights[i] * reduction, 0.01, SINGLE_NAME_LIMIT)),
+            current_value=float(sleeve_weights[i]),
+            limit=float(np.clip(sleeve_weights[i] * reduction, floor, SINGLE_NAME_LIMIT)),
         )
         for i, t in enumerate(tickers)
-        if weights[i] > 0
+        if overweight[i]
     ]
+
+
+def _risky_weight_cap_constraint(
+    risky_weight: float,
+    current_mdd: float,
+    cap: float,
+) -> AllocationConstraint:
+    """
+    Direct cap on total risky weight, sized to the actual drawdown breach —
+    drawdown scales roughly linearly with risky weight for a fixed sleeve
+    composition, so risky_weight * (cap / current_mdd) is the level that
+    would clear the cap. Unlike the profile-tier downgrade (a fixed step that
+    stops once CONSERVATIVE is reached regardless of how much reduction is
+    still needed), this scales with the size of the breach and keeps working
+    even at the floor of the profile ladder. Each FLAG iteration also
+    re-optimizes which tickers are held (single-name tightening runs
+    alongside this), so the fixed-sleeve linearity assumption is only
+    approximate — a wider margin than the other flag constraints' 0.99
+    absorbs that drift instead of landing just barely over the cap again.
+    """
+    target = risky_weight * (cap / current_mdd) * 0.90
+    return AllocationConstraint(
+        constraint_type=ConstraintType.RISKY_WEIGHT_CAP,
+        target="risky_weight",
+        current_value=risky_weight,
+        limit=float(np.clip(target, 0.0, 1.0)),
+    )
 
 
 def make_decision(
@@ -347,6 +394,7 @@ def make_decision(
     flag_iteration: int,
     tickers: list[str],
     weights: np.ndarray,
+    risky_weight: float,
 ) -> tuple[RiskDecision, list[AllocationConstraint]]:
     """
     Deterministic APPROVE / FLAG / REJECT decision.
@@ -354,8 +402,8 @@ def make_decision(
     REJECT conditions (structurally unfixable):
       - idiosyncratic_employer_exposure > EMPLOYER_LIMIT even at zero employer
         stock in the portfolio: the client's genuinely employer-specific risk
-        (employer stock + _EMPLOYER_HC_SHOCK share of HC) alone breaches the
-        limit, so no reallocation can fix it
+        (employer stock + RSU-linked wealth) alone breaches the limit, so no
+        reallocation can fix it
       - CRITICAL stress while already at CONSERVATIVE: no further downgrade possible
       - flag_iteration >= 2 with real violations remaining
 
@@ -387,14 +435,24 @@ def make_decision(
     flag_constraints: list[AllocationConstraint] = list(violations)
 
     if drawdown_breach:
-        flag_constraints += _drawdown_flag_constraints(tickers, weights, max_drawdown, cap)
+        flag_constraints += _drawdown_flag_constraints(tickers, weights, risky_weight, max_drawdown, cap)
+        flag_constraints.append(_risky_weight_cap_constraint(risky_weight, max_drawdown, cap))
 
+    downgrade_constraints: list[AllocationConstraint] = []
     if needs_downgrade:
-        flag_constraints += _stress_flag_constraints(effective_risk_profile)
+        downgrade_constraints = _stress_flag_constraints(effective_risk_profile)
+        flag_constraints += downgrade_constraints
 
-    # Carry an existing profile downgrade forward so it survives subsequent FLAG
-    # iterations that may only generate other constraint types (e.g. drawdown).
-    if effective_risk_profile != risk_profile and not needs_downgrade:
+    # Carry an existing profile downgrade forward whenever this round didn't
+    # itself emit a new one — either because none was needed, or because
+    # effective_risk_profile is already CONSERVATIVE (the floor) and
+    # _stress_flag_constraints has nowhere further to downgrade to, even
+    # though needs_downgrade is still True. Gating this on `not needs_downgrade`
+    # instead of `not downgrade_constraints` drops the downgrade in that
+    # already-at-the-floor-but-still-breaching case: the next iteration then
+    # silently reverts to the un-downgraded profile, making the portfolio
+    # riskier right when it should be getting safer.
+    if effective_risk_profile != risk_profile and not downgrade_constraints:
         flag_constraints.append(AllocationConstraint(
             constraint_type=ConstraintType.RISK_PROFILE_DOWNGRADE,
             target=effective_risk_profile.value,
@@ -482,11 +540,27 @@ def run_risk(
     liq = compute_liquidity_score(weights, tickers, crsp_daily, permno_map)
 
     employer_fin_weight = weight_dict.get(hc.employer_ticker, 0.0)
-    hc_frac             = _hc_fraction(up.financial_wealth, hc.present_value)
+
+    # employer_concentration() (human_capital.py) attributes 100% of HC to the
+    # employer — a deliberately conservative worst-case number kept as-is for
+    # HumanCapitalAdjustedMetrics reporting/audit. For the pass/fail gate and
+    # the stress scenario below, rsu_concentration is "fraction of financial
+    # holdings in employer RSUs" (contracts.py) — it must scale
+    # financial_wealth, not human_capital_pv. HC dominates total wealth for
+    # most working clients, so scaling it by HC instead inflated this to
+    # ~30%+ for any RSU-eligible client regardless of actual holdings,
+    # guaranteeing REJECT independent of allocation. Scaled correctly, a
+    # modest RSU grant against a small savings balance is correctly a small
+    # fraction of total wealth (savings + career value) even though it may
+    # dominate the (small) financial account itself.
+    tw = total_wealth(up.financial_wealth, hc.present_value)
+    idiosyncratic_employer_exposure = (
+        employer_fin_weight * up.financial_wealth + hc.rsu_concentration * up.financial_wealth
+    ) / tw
+
     stress_results = compute_stress_results(
         weights, tickers, crsp_daily, permno_map,
-        drawdown_cap, hc.employer_ticker,
-        employer_fin_weight, hc_frac,
+        drawdown_cap, idiosyncratic_employer_exposure,
     )
 
     hc_adj = compute_hc_adjusted_metrics(
@@ -495,25 +569,20 @@ def run_risk(
         hc.income_beta, hc.employer_sector, hc.employer_ticker,
     )
 
-    # employer_concentration() (human_capital.py) attributes 100% of HC to the
-    # employer — a deliberately conservative worst-case number kept as-is for
-    # HumanCapitalAdjustedMetrics reporting/audit. For the pass/fail gate below,
-    # only rsu_concentration's share of HC is idiosyncratically tied to this
-    # one employer (RSUs/equity comp mean job and portfolio both ride on the
-    # same company); the rest is ordinary, diversifiable-across-employers
-    # career risk already priced in via income_beta / portfolio_equity_target.
-    # A salaried client with zero equity comp (rsu_concentration=0) correctly
-    # contributes ~0 idiosyncratic employer risk from HC alone.
-    tw = total_wealth(up.financial_wealth, hc.present_value)
-    idiosyncratic_employer_exposure = (
-        employer_fin_weight * up.financial_wealth + hc.present_value * hc.rsu_concentration
-    ) / tw
+    # hc_adj.economic_sector_exposures blends in 100% of HC PV for the
+    # employer's sector — a deliberately conservative worst-case kept as-is
+    # for audit/reporting (same rationale as employer_concentration above).
+    # The pass/fail gate uses portfolio-only sector exposure instead: the
+    # employer's own sector is already capped well below the general limit
+    # by optimize_weights' default EMPLOYER_SECTOR_LIMIT, so this check now
+    # only fires on genuine, allocation-fixable portfolio concentration.
+    portfolio_sector_exposures = aggregate_sector_weights(weight_dict, universe.sectors)
 
     flags      = run_all_checks(weight_dict, universe.sectors,
-                                hc_adj.economic_sector_exposures,
+                                portfolio_sector_exposures,
                                 idiosyncratic_employer_exposure)
     violations = all_violations(weight_dict, universe.sectors,
-                                hc_adj.economic_sector_exposures,
+                                portfolio_sector_exposures,
                                 idiosyncratic_employer_exposure)
 
     decision, flag_constraints = make_decision(
@@ -528,6 +597,7 @@ def run_risk(
         flag_iteration                   = ai.flag_iteration,
         tickers                          = tickers,
         weights                          = weights,
+        risky_weight                     = ao.risky_weight,
     )
 
     risk_metrics = RiskMetrics(

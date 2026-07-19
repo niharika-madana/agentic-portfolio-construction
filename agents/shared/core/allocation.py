@@ -8,8 +8,11 @@ from contracts import (
     AllocationConstraint, AllocationInput, AllocationOutput,
     ConstraintType, FactorExposures, PortfolioStatistics, RiskProfile, WeightDecomposition,
 )
-from agents.shared.core.constraints import SINGLE_NAME_LIMIT, SECTOR_LIMIT
+from agents.shared.core.constraints import (
+    SINGLE_NAME_LIMIT, SECTOR_LIMIT, EMPLOYER_STOCK_LIMIT, EMPLOYER_SECTOR_LIMIT,
+)
 from agents.shared.core.human_capital import compute_w_fin, merton_risky_share
+from agents.shared.core.risk import MAX_DRAWDOWN_CAP
 
 
 TAU             = 0.025
@@ -114,6 +117,7 @@ def optimize_weights(
     sectors: dict[str, str],
     flag_constraints: list[AllocationConstraint],
     employer_ticker: str | None = None,
+    employer_sector: str | None = None,
     financial_wealth: float = 0.0,
     human_capital_pv: float = 0.0,
 ) -> np.ndarray:
@@ -121,12 +125,21 @@ def optimize_weights(
     upper = np.full(N, SINGLE_NAME_LIMIT)
     sector_limits: dict[str, float] = {}
 
+    # Baseline rules, applied on every optimization regardless of any prior
+    # FLAG round: never hold the employer's own stock, and cap the employer's
+    # own sector below the general limit — both are already carried via
+    # career + equity comp, so the portfolio shouldn't add to either.
+    if employer_ticker and employer_ticker in tickers:
+        upper[tickers.index(employer_ticker)] = EMPLOYER_STOCK_LIMIT
+    if employer_sector:
+        sector_limits[employer_sector] = EMPLOYER_SECTOR_LIMIT
+
     for fc in flag_constraints:
         if fc.constraint_type == ConstraintType.SINGLE_NAME and fc.target in tickers:
             idx = tickers.index(fc.target)
             upper[idx] = min(upper[idx], fc.limit * 0.99)
         elif fc.constraint_type == ConstraintType.SECTOR:
-            sector_limits[fc.target] = fc.limit * 0.99
+            sector_limits[fc.target] = min(sector_limits.get(fc.target, SECTOR_LIMIT), fc.limit * 0.99)
         elif fc.constraint_type == ConstraintType.EMPLOYER:
             if employer_ticker and employer_ticker in tickers:
                 idx   = tickers.index(employer_ticker)
@@ -137,7 +150,9 @@ def optimize_weights(
         elif fc.constraint_type == ConstraintType.ECONOMIC_SECTOR:
             if financial_wealth + human_capital_pv > 0:
                 fin_share = financial_wealth / (financial_wealth + human_capital_pv)
-                sector_limits[fc.target] = fc.limit * fin_share * 0.99
+                sector_limits[fc.target] = min(
+                    sector_limits.get(fc.target, SECTOR_LIMIT), fc.limit * fin_share * 0.99
+                )
 
     bounds = Bounds(lb=np.zeros(N), ub=upper)
     unique_sectors = list({sectors.get(t, "Unknown") for t in tickers})
@@ -168,8 +183,13 @@ def optimize_weights(
     )
 
     if not result.success:
-        w = np.clip(np.full(N, 1.0 / N), 0.0, upper)
-        return w / w.sum()
+        # Bounded proportional fill: each ticker gets a share of the sum-to-1
+        # target proportional to its own upper bound, so a flag-tightened
+        # ticker stays low and untightened tickers absorb the rest — unlike
+        # clip-then-renormalize, this never pushes any ticker past its bound.
+        total = float(upper.sum())
+        scale = min(1.0, 1.0 / total) if total > 0 else 0.0
+        return upper * scale
     return result.x
 
 
@@ -232,6 +252,7 @@ def run_allocation(
         sectors=universe.sectors,
         flag_constraints=allocation_input.flag_constraints,
         employer_ticker=hc.employer_ticker,
+        employer_sector=hc.employer_sector,
         financial_wealth=up.financial_wealth,
         human_capital_pv=hc.present_value,
     )
@@ -259,8 +280,27 @@ def run_allocation(
     # Cap the HC-adjusted risky weight at the Profile Agent's equity target so
     # total (career + portfolio) equity exposure never exceeds the client's
     # risk budget. Negative targets (career already exceeds budget) force w_fin to 0.
+    # portfolio_equity_target is a balance-sheet capacity number (savings +
+    # career value + income stability) — it has no risk_profile input, so it
+    # doesn't move on its own when effective_risk_profile is downgraded. When
+    # this cap (not alpha) is the binding constraint, a downgrade would
+    # otherwise leave w_fin completely unchanged — the FLAG loop's only real
+    # remediation lever would be a no-op. Scale it down by the same ratio the
+    # downgrade tightens the drawdown cap, so a downgrade always reduces the
+    # final risky weight regardless of which constraint was binding before.
     equity_cap = float(np.clip(up.portfolio_equity_target, 0.0, 1.0))
+    if effective_risk_profile != up.risk_profile:
+        equity_cap *= MAX_DRAWDOWN_CAP[effective_risk_profile] / MAX_DRAWDOWN_CAP[up.risk_profile]
     w_fin      = min(w_fin, equity_cap)
+
+    # RISKY_WEIGHT_CAP is a direct cap sized to the actual drawdown breach
+    # (risky_weight * cap/current_mdd from make_decision), not a fixed
+    # per-tier step — unlike equity_cap's downgrade scaling above, it keeps
+    # shrinking to match the breach even after effective_risk_profile has
+    # already hit CONSERVATIVE and has no further downgrade step to give.
+    for fc in allocation_input.flag_constraints:
+        if fc.constraint_type == ConstraintType.RISKY_WEIGHT_CAP:
+            w_fin = min(w_fin, fc.limit)
 
     decomposition = [
         WeightDecomposition(

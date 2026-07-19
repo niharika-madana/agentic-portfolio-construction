@@ -103,6 +103,7 @@ class ConstraintType(str, Enum):
     ECONOMIC_SECTOR      = "economic_sector"
     EMPLOYER             = "employer"
     RISK_PROFILE_DOWNGRADE = "risk_profile_downgrade"  # AGGRESSIVE→MODERATE→CONSERVATIVE on critical stress
+    RISKY_WEIGHT_CAP     = "risky_weight_cap"  # direct cap on total risky weight, sized to the actual drawdown breach
 
 
 class RiskProfile(str, Enum):

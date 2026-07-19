@@ -8,6 +8,12 @@ SECTOR_LIMIT          = 0.20
 ECONOMIC_SECTOR_LIMIT = 0.25
 EMPLOYER_LIMIT        = 0.15
 
+# Applied by default on every optimization run (not just reactively after a
+# Risk FLAG) — the client's own employer and employer's sector are already
+# carried via career + equity comp, so the portfolio shouldn't add to either.
+EMPLOYER_STOCK_LIMIT  = 0.0
+EMPLOYER_SECTOR_LIMIT = 0.10
+
 
 def aggregate_sector_weights(
     weights: dict[str, float],
