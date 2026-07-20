@@ -1,7 +1,7 @@
 # Profile Agent — Design Document
 **AI Financial Advisor Pipeline | Agent 1 of 5**
 *Fordham MSQF Capstone 2026*
-*Last updated: 2026-07-02 (post-refactor sync — module structure consolidated into `profile_agent.py` + `profile_model.py` [loaders.py/hc_beta_table.py/personas.py/human_capital.py/beta.py removed]; income_stability proof-of-categorization added; output paths moved to `data/outputs/`. Prior: 2026-06-30 — schema alignment enforced; `include_percentile_variants` exposed; unit tests added; pandas pinned to 2.x)*
+*Last updated: 2026-07-20 (July 14 meeting action item — `implied_market_volatility` diagnostic added (σ_market = ρ × σ_income / β); calibration-inconsistency finding documented; corrected two doc errors: `income_stability` enum case in the example JSON, and the BLS OES parquet filename; added `tier_derivation.py` — a reproducible, executable check that recomputes `income_stability` tiers from encoded signals and asserts the result matches the declared label. Prior: 2026-07-02 — post-refactor sync, module structure consolidated into `profile_agent.py` + `profile_model.py` [loaders.py/hc_beta_table.py/personas.py/human_capital.py/beta.py removed]; income_stability proof-of-categorization added; output paths moved to `data/outputs/`. Prior: 2026-06-30 — schema alignment enforced; `include_percentile_variants` exposed; unit tests added; pandas pinned to 2.x)*
 
 ---
 
@@ -18,7 +18,7 @@ The agent is fully data-driven. Every numeric field traces to a primary source (
 ```
 FRED DGS10              → discount_rate (live 10Y Treasury yield)
 BLS OES May 2023        → salary percentiles by SOC code
-                           cached as data/storage/bls_oes_2023.parquet
+                           cached as data/storage/bls_oes.parquet
 BLS ECEC Q1 2026        → bonus_rate by SOC code (BONUS_RATE_TABLE)
 SCF 2022 (static table) → financial_capital by age × income quartile
                                ↓
@@ -48,10 +48,16 @@ agents/profile/
 ├── profile_model.py    Domain model — merged from hc_beta_table.py + human_capital.py
 │                       + personas.py. Holds: HC_BETA_TABLE / INCOME_VOLATILITY_SIGMA /
 │                       HUMAN_CAPITAL_TYPE (β/ρ/σ tables), lookup_hc_beta(),
+│                       implied_market_volatility() [diagnostic],
 │                       compute_human_capital()/build_profile(), TARGET_OCCUPATIONS +
 │                       build_bls_personas(), BONUS_RATE_TABLE, SCF_FINANCIAL_ASSETS,
 │                       get_age_bracket(), lookup_financial_capital(),
 │                       and INCOME_STABILITY_BASIS (proof-of-categorization + integrity check)
+├── tier_derivation.py  Reproducible derivation of the income_stability tiers — recomputes
+│                       each tier from BONUS_RATE_TABLE + RSU_BY_PERCENTILE + has_pension and
+│                       asserts it matches the label in TARGET_OCCUPATIONS. See
+│                       [Tier Derivation — Reproducibility Check](#tier-derivation--reproducibility-check).
+│                       Run via `python -m agents.profile.tier_derivation`.
 └── __init__.py
 ```
 
@@ -111,21 +117,35 @@ Portfolio Equity Target = Effective Risk Budget − Implicit Equity Exposure
 
 A negative value means the client's career already provides more equity exposure than their total risk budget allows. The Allocation Agent should underweight equity relative to a naive risk-tolerance-only approach.
 
+### Implied Market Volatility — Diagnostic Only
+
+*Added per the July 14 meeting action item.* The single-factor identity that relates the three income-risk parameters is:
+
+```
+β = ρ × σ_income / σ_market     ⇒     σ_market = ρ × σ_income / β
+```
+
+`implied_market_volatility()` in `profile_model.py` inverts the identity and emits the result per profile. **Nothing downstream consumes it** — it exists to make the calibration's internal consistency visible and auditable. Returns `None` when β ≤ 0, where the identity is undefined.
+
+Because σ, β and ρ are calibrated independently (see [Beta and Correlation](#beta-and-correlation--calibrated-table)), this does **not** resolve to a single market volatility — see the table in Income Risk Parameters below. That spread is the finding, not a bug.
+
 ---
 
 ## Income Risk Parameters
 
-| Stability | σ | HC Type | Applies To | β | ρ |
-|---|---|---|---|---|---|
-| High | 0.05 | bond-like | Academia, government, military, nurses | 0.05 | 0.10 |
-| Medium | 0.20 | mixed | Legal, engineering, healthcare admin, analysts | 0.35 | 0.40 |
-| Low | 0.40 | equity-like | Tech (RSU), finance (bonus), sales (commission) | 0.90 | 0.75 |
+| Stability | σ | HC Type | Applies To | β | ρ | Implied σ_market |
+|---|---|---|---|---|---|---|
+| High | 0.05 | bond-like | Academia, government, military, nurses | 0.05 | 0.10 | 0.1000 |
+| Medium | 0.20 | mixed | Legal, engineering, healthcare admin, analysts | 0.35 | 0.40 | 0.2286 |
+| Low | 0.40 | equity-like | Tech (RSU), finance (bonus), sales (commission) | 0.90 | 0.75 | 0.3333 |
 
 `σ` (income_volatility_sigma) — total annualised earnings uncertainty. Used in the effective risk budget formula.
 
 `β` (income_equity_beta) — systematic sensitivity of income to equity market returns. Used to compute implicit equity exposure.
 
 `ρ` (income_equity_correlation) — correlation of income changes with equity market returns. Used by the Risk Agent to compute HC-correlation adjusted sector limits: `adjusted_limit = base_limit × (1 − ρ)`. A software developer with ρ = 0.75 faces a much tighter technology sector limit than a biology professor with ρ = 0.10.
+
+`Implied σ_market` (implied_market_volatility) — **diagnostic only, consumed by nothing.** `ρ × σ / β`, i.e. the market volatility each row would imply under a strict single-factor model. See the calibration note below.
 
 HC type boundaries (enforced by `contracts.py` `_check_hc_type_consistent_with_beta` validator):
 - `bond-like`: β ≤ 0.30
@@ -144,6 +164,40 @@ The per-occupation justification is recorded in `INCOME_STABILITY_BASIS` (`profi
 
 > Sources: BLS ECEC Q1 2026, Table 5 (supplemental-pay share by occupational group); BLS CPS occupational unemployment; Davis & Willen (2000), occupational income betas.
 
+### Tier Derivation — Reproducibility Check
+
+`INCOME_STABILITY_BASIS` documents *why* each occupation carries its tier, in prose. `tier_derivation.py` makes that reasoning executable: it recomputes every tier from the encoded signals and asserts the result matches the declared label. Run `python -m agents.profile.tier_derivation` to print the derivation table.
+
+**Scope — 2 of the 3 cited signals are encoded.** The prose basis cites three signals (variable-compensation share, cyclical employment risk, institutional job protection). Only the first, plus the `has_pension` slice of the third, are actually encoded anywhere in this repo:
+
+1. **Variable-compensation share** — `BONUS_RATE_TABLE` (BLS ECEC Q1 2026, Table 5) plus equity comp via `rsu_eligible`. **Encoded.**
+2. **Cyclical employment risk** — per-occupation BLS CPS unemployment. **Not encoded.** No CPS fetcher exists in this repo; the only unemployment series present is FRED's aggregate `UNRATE`, consumed by the Research Agent, which is not occupation-specific.
+3. **Institutional job protection** — partially encoded, as `has_pension`. Licensure, tenure, and civil-service status are not separate fields.
+
+So the derivation is a scoring rule over signals (1) and the `has_pension` slice of (3) — not the full three-signal basis the prose describes.
+
+**Scoring rule.** `score_occupation()` computes a market-exposure score in units of `BONUS_RATE_TABLE`'s supplemental-pay-to-wages ratio:
+
+```
+score = BONUS_RATE_TABLE[soc]
+      + RSU_PREMIUM        if rsu_eligible   (0.35 — reuses RSU_BY_PERCENTILE["p50"])
+      − PENSION_DISCOUNT    if has_pension    (0.02)
+```
+
+Tier cutoffs sit at the gaps between BLS ECEC occupational-group ratios: `HIGH_MAX = 0.050`, `MEDIUM_MAX = 0.100`.
+
+`PENSION_DISCOUNT = 0.02` is the rule's one free parameter — **calibrated, not measured**: it's the smallest round value that pulls a pensioned worker in the ECEC "Professional and related" group (0.060) below `HIGH_MAX`, without pulling an unpensioned one below it. It's what distinguishes Compliance Officer (High) from Lawyer and Mechanical Engineer (Medium) — all three share `bonus_rate = 0.060`. It stands in for the civil-service/tenure protection that signal (3) describes but does not fully encode.
+
+**Result: 8 of 9 tiers reproduced.** The ninth, Sales Manager (11-2022), is a documented override rather than a tuned threshold:
+
+| SOC | Occupation | Rule computes | Declared tier | Why |
+|---|---|---|---|---|
+| 11-2022 | Sales Manager | Medium (score 0.050, below Financial Analyst's 0.085 and Lawyer's 0.060) | Low | Commission is not a field in this repo. The ECEC "Sales and related" ratio (0.050) captures only supplemental pay, not commission — so the rule under-scores it. This is an artifact of the missing field, not a claim that sales income is stable: commission revenue tracks consumer-discretionary demand, giving this occupation equity-like earnings variance. Encoding a commission share would remove the need for this override. |
+
+Every override must state what the rule computes, what the true tier is, and which unencoded signal justifies the gap — this keeps `OVERRIDES` from becoming a dumping ground for rows the rule simply fails to explain.
+
+**Sensitivity note.** Registered Nurse (score 0.046, no pension) sits only 0.004 below `HIGH_MAX`: its High tier is reproduced by the rule here, but it's the row most sensitive to the threshold, and its prose basis in `INCOME_STABILITY_BASIS` leans on licensure and counter-cyclical healthcare demand — both unencoded signals. If `HIGH_MAX` is ever retuned, this is the row to check first.
+
 ---
 
 ## Data Sources
@@ -157,7 +211,7 @@ Live 10Y Treasury yield pulled via FRED API at runtime. Falls back to 4.4% on fa
 
 **Bureau of Labor Statistics, Occupational Employment and Wage Statistics, May 2023 National Estimates.**
 
-Downloaded as a flat file from BLS (`national_M2023_dl.xlsx`) and cached locally as `data/storage/bls_oes_2023.parquet` on first run. Subsequent runs load from parquet. Columns used:
+Downloaded as a flat file from BLS (`national_M2023_dl.xlsx`) and cached locally as `data/storage/bls_oes.parquet` on first run. Subsequent runs load from parquet. Columns used:
 
 | Column | Description |
 |---|---|
@@ -198,7 +252,7 @@ bonus_rate = supplemental_pay_pct / wages_and_salaries_pct
 
 **Federal Reserve, Survey of Consumer Finances 2022, Table 6: "Median Family Financial Assets."**
 
-Published every 3 years; no live API. Implemented as a static dict in `loaders.SCF_FINANCIAL_ASSETS`:
+Published every 3 years; no live API. Implemented as a static dict in `profile_model.SCF_FINANCIAL_ASSETS`:
 
 ```
 (age_bracket, income_quartile) → median investable financial assets
@@ -242,6 +296,34 @@ Davis & Willen (2000), *"Using Financial Assets to Hedge Labor Income Risks: Est
 **Consistency with contracts.py:** The three calibrated β values (0.05, 0.35, 0.90) fall squarely within the threshold ranges validated by `_check_hc_type_consistent_with_beta`. No edge cases.
 
 **Why not OLS?** OLS requires observed income data correlated with market returns. BLS OES provides cross-sectional wage levels, not a time series of income changes by individual. Without panel data (e.g., PSID, NLSY79), a regression would require synthetic income shocks — which is what the prior design did, producing meaningless results. The calibrated table is more honest about this limitation and cites real empirical estimates.
+
+### Known Calibration Inconsistency
+
+*Raised in the July 14 review; documented rather than silently corrected.*
+
+σ, β and ρ are each calibrated **independently**, from a different source, for a different downstream consumer:
+
+| Parameter | Calibration source | Consumed by |
+|---|---|---|
+| σ | BLS ECEC supplemental-pay share + occupational cyclicality | `effective_risk_budget` |
+| β | Davis & Willen (2000) occupational income betas | `implicit_equity_exposure` |
+| ρ | Ibbotson et al. (2007) HC-type framework | Risk Agent HC-adjusted sector limits |
+
+They are **not** jointly estimated. Inverting the single-factor identity `σ_market = ρ × σ / β` therefore yields a different market volatility per tier rather than one common value:
+
+| HC Type | Calculation | Implied σ_market |
+|---|---|---|
+| bond-like | 0.10 × 0.05 / 0.05 | **10.00%** |
+| mixed | 0.40 × 0.20 / 0.35 | **22.86%** |
+| equity-like | 0.75 × 0.40 / 0.90 | **33.33%** |
+
+A true single-factor model requires all three to equal one σ_market. Realised US equity volatility sits around 16–20%, so the mixed tier is roughly plausible while bond-like is far too low and equity-like far too high. The bond-like row is the largest outlier — β = 0.05 is small enough that the ratio is highly sensitive to it, making β the most likely culprit if the team recalibrates.
+
+**Interpretation.** This confirms what the table already claims to be: a pragmatic calibration anchored to published estimates, not a strict econometric model. Presenting it as single-factor-consistent would be a misrepresentation.
+
+**Why it is left uncorrected.** Retuning β or ρ to force a common σ_market would change `implicit_equity_exposure` for every persona, which propagates directly into `portfolio_equity_target` and therefore into every downstream allocation and risk check. That is a team decision with blast radius well outside the Profile Agent, not a side effect of adding a diagnostic. Surfacing the number per-profile makes the discrepancy visible and auditable in the meantime.
+
+> **Deliberately unvalidated.** No `model_validator` cross-checks `implied_market_volatility` against the identity — such a check would fail every profile the agent produces. The field is descriptive, not a constraint.
 
 ---
 
@@ -358,6 +440,7 @@ Higher salary percentile → larger equity grant as a fraction of total compensa
 | **HC Type** | bond-like | mixed | equity-like |
 | **β** | 0.05 | 0.35 | 0.90 |
 | **ρ** | 0.10 | 0.40 | 0.75 |
+| **Implied σ_market** *(diagnostic)* | 0.1000 | 0.2286 | 0.3333 |
 | **Implicit Equity Exposure** | **0.042** | **0.332** | **0.865** |
 | **Effective Risk Budget** | 0.958 | 0.811 | 0.616 |
 | **Portfolio Equity Target** | **+0.916** | **+0.479** | **−0.249** |
@@ -378,7 +461,9 @@ The biology professor's bond-like income — a stable, government-indifferent sa
 3. `_check_implicit_equity_exposure` — enforces `hc_share × β` within 0.01 tolerance
 4. `_check_hc_type_consistent_with_beta` — β thresholds must match `human_capital_type` label
 
-Example output for Biology Professor (p50):
+Note the enum casing: `income_stability`, `human_capital_type`, `risk_tolerance_level`, `liquidity_needs` and `investment_objective` are all **lowercase** on the wire (`"high"`, not `"High"`). The `High`/`Medium`/`Low` keys used in `INCOME_VOLATILITY_SIGMA` and `TARGET_OCCUPATIONS` are internal only — `build_profile()` maps them via `_STABILITY_TO_CONTRACT` before validation.
+
+Example output for Biology Professor (p50, r = 4.4%):
 
 ```json
 {
@@ -392,9 +477,10 @@ Example output for Biology Professor (p50):
   "income_volatility_sigma": 0.05,
   "income_equity_beta": 0.05,
   "income_equity_correlation": 0.10,
+  "implied_market_volatility": 0.1,
   "implicit_equity_exposure": 0.042,
   "human_capital_type": "bond-like",
-  "income_stability": "High",
+  "income_stability": "high",
   "effective_risk_budget": 0.958,
   "portfolio_equity_target": 0.916,
   "industry_exposure_sector": "Education",
@@ -402,9 +488,9 @@ Example output for Biology Professor (p50):
   "has_pension": true,
   "bonus_rate": 0.046,
   "current_holdings": {
-    "US_equity": 0.50,
+    "US_equity": 0.40,
     "intl_equity": 0.15,
-    "bonds": 0.25,
+    "bonds": 0.35,
     "cash": 0.10
   },
   "investment_horizon_years": 18,
@@ -418,7 +504,7 @@ Example output for Biology Professor (p50):
 
 ## Unit Tests
 
-Deterministic unit tests in `test_profile.py` (no live API calls — uses fixed discount rate 4.4%). Beta/correlation are not passed in; `build_profile()` looks them up from `hc_beta_table` by HC type, so the fixtures mirror `build_bls_personas()` output. The four load-bearing cases:
+Deterministic unit tests in `test_profile.py` (no live API calls — uses fixed discount rate 4.4%). Beta/correlation are not passed in; `build_profile()` looks them up from `HC_BETA_TABLE` (in `profile_model.py`) by HC type, so the fixtures mirror `build_bls_personas()` output. The four load-bearing cases:
 
 | Test | Persona | What It Checks |
 |---|---|---|
@@ -430,6 +516,8 @@ Deterministic unit tests in `test_profile.py` (no live API calls — uses fixed 
 Supporting tests cover the annuity formula directly, the effective-risk-budget formula, that the bonus raises HC above a base-salary-only PV, the calibrated `lookup_hc_beta` return type, the holdings-sum validator, and the adapter round-trip — 11 tests, all passing.
 
 HC values confirmed against the annuity formula (r = 4.4%): Software Developer (effective $143,513, n=27) HC = $2,241,835; Biology Professor (effective $87,780, n=18) HC = $1,075,965.
+
+`tier_derivation.py` additionally asserts, at minimum, that every entry in `OVERRIDES` is load-bearing (i.e. the rule's computed tier for that SOC code genuinely differs from the declared one) — so `OVERRIDES` can't silently accumulate rows the rule already explains correctly.
 
 ---
 
@@ -463,7 +551,7 @@ HC values confirmed against the annuity formula (r = 4.4%): Software Developer (
 ### BLS SOC Code Not Found
 A SOC code in `TARGET_OCCUPATIONS` is missing from the downloaded OES flat file (e.g. new occupation not yet surveyed, or file format change).
 
-**Handling:** `build_bls_personas()` prints a warning and skips the occupation. Pipeline does not crash. Run `load_bls_oes()` interactively and check available SOC codes if this occurs.
+**Handling:** `build_bls_personas()` prints a warning and skips the occupation. Pipeline does not crash. Run `_load_bls_oes()` (in `profile_agent.py`) interactively and check available SOC codes if this occurs.
 
 ### BLS Wage Suppressed
 BLS suppresses wages (`#`) for small sample sizes or for the 90th percentile of very high-paying roles.
@@ -481,7 +569,7 @@ FRED is unreachable or the API key is invalid.
 **Handling:** Clean fallback to 4.4% with a printed warning. The pipeline continues. Log the fallback rate in the output JSON so it's visible in the audit trail.
 
 ### Holdings Not Summing to 1.0
-`_derive_current_holdings()` constructs all allocations arithmetically from a base of 1.0, so this cannot occur from the BLS pipeline. Only possible if holdings are set manually. Caught by `_check_holdings_sum` Pydantic validator before the profile exits the agent.
+`derive_current_holdings()` constructs all allocations arithmetically from a base of 1.0, so this cannot occur from the BLS pipeline. Only possible if holdings are set manually. Caught by `_check_holdings_sum` Pydantic validator before the profile exits the agent.
 
 ---
 
@@ -490,7 +578,7 @@ FRED is unreachable or the API key is invalid.
 - **Entry point:** `agents/profile/profile_agent.py` → `run_profile_agent()`
 - **Beta source:** `HC_BETA_TABLE` in `agents/profile/profile_model.py` (via `lookup_hc_beta()`) — the only authorised source. The former `hc_beta_table.py` and deprecated `beta.py` have been removed.
 - **Environment:** pandas pinned to `>=2.0,<3.0` across all agents (pandas 3.x caused parquet load errors — team decision June 25 2026)
-- **BLS OES source file:** `national_M2023_dl.xlsx` — converted and cached as `data/storage/bls_oes_2023.parquet` on first run
+- **BLS OES source file:** `national_M2023_dl.xlsx` — converted and cached as `data/storage/bls_oes.parquet` on first run
 - **Output (JSON):** `data/outputs/profiles_all.json`
 - **Output (Parquet):** `data/storage/profiles_all.parquet` — consumed by Allocation, Risk, Compliance agents
 - **Runtime environment:** Google Colab or local Python 3.11+
