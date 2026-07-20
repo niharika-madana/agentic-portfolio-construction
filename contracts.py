@@ -208,6 +208,20 @@ class ProfileAgentOutput(BaseModel):
             "Tech exec ≈ 1.2, financial professional ≈ 0.6, biology professor ≈ 0.05."
         )
     )
+    implied_market_volatility: Optional[float] = Field(
+        default=None, ge=0, le=1,
+        description=(
+            "DIAGNOSTIC ONLY — no downstream agent should consume this. "
+            "σ_market implied by inverting the single-factor identity: "
+            "σ_market = income_equity_correlation × income_volatility_sigma / income_equity_beta. "
+            "σ, β and ρ are calibrated independently from separate sources for separate "
+            "purposes, so this does NOT resolve to one common market volatility across "
+            "human-capital types (bond-like 10%, mixed ≈23%, equity-like ≈33%). That spread "
+            "is the finding: the calibration is pragmatic, not a strict econometric model. "
+            "Deliberately unvalidated — a cross-check against the identity would fail every "
+            "profile. None when income_equity_beta ≤ 0, where the identity is undefined."
+        )
+    )
     implicit_equity_exposure: float = Field(
         description=(
             "hc_share × income_equity_beta. "
