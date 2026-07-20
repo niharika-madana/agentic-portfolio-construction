@@ -43,6 +43,27 @@ HUMAN_CAPITAL_TYPE = {
 # Calibrated β and ρ per HC type.
 # β = income_equity_beta  — systematic sensitivity of income to equities
 # ρ = income_equity_correlation
+#
+# ── Known calibration inconsistency (14 Jul 2026 review) ───────────────────
+# σ (INCOME_VOLATILITY_SIGMA), β, and ρ are each calibrated independently from
+# a different literature source, for a different downstream purpose:
+#   σ → effective_risk_budget;  β → implicit_equity_exposure;  ρ → Risk Agent's
+#   HC-adjusted sector limits.
+# They are NOT jointly estimated. So the single-factor identity
+#   β = ρ × σ_income / σ_market   ⇒   σ_market = ρ × σ_income / β
+# does not resolve to one common market volatility across the three tiers:
+#   bond-like:   0.10 × 0.05 / 0.05 = 10.0%
+#   mixed:       0.40 × 0.20 / 0.35 ≈ 22.9%
+#   equity-like: 0.75 × 0.40 / 0.90 ≈ 33.3%
+# A single-factor model would require all three to equal one σ_market (~16-20%
+# for US equities). The spread is the honest reading: this table is a pragmatic
+# calibration, not a strict econometric model.
+# Surfaced per-profile as implied_market_volatility (see below) so the
+# discrepancy is visible and auditable rather than hidden. Left uncorrected on
+# purpose — retuning β or ρ to force consistency would shift
+# implicit_equity_exposure and therefore portfolio_equity_target for every
+# persona, changing all downstream allocations. That is a team decision, not a
+# side effect of adding the diagnostic.
 HC_BETA_TABLE = {
     "bond-like":   {"beta": 0.05, "correlation": 0.10},
     "mixed":       {"beta": 0.35, "correlation": 0.40},
@@ -66,6 +87,22 @@ def lookup_hc_beta(hc_type: str) -> dict[str, float]:
     if hc_type not in HC_BETA_TABLE:
         raise KeyError(f"Unknown human_capital_type '{hc_type}'. Expected one of {list(HC_BETA_TABLE)}.")
     return dict(HC_BETA_TABLE[hc_type])
+
+
+def implied_market_volatility(
+    sigma: float, beta: float, correlation: float
+) -> float | None:
+    """
+    σ_market implied by the single-factor identity β = ρ × σ_income / σ_market.
+
+    Diagnostic only — no downstream calculation consumes it. Because σ, β and ρ
+    are calibrated separately (see the note above HC_BETA_TABLE), this returns a
+    different value per HC type rather than one common market volatility.
+    Returns None when β ≤ 0, where the identity is undefined.
+    """
+    if beta <= 0:
+        return None
+    return round(correlation * sigma / beta, 4)
 
 
 # ===========================================================================
@@ -117,6 +154,7 @@ def build_profile(persona: dict, discount_rate: float) -> dict:
 
     hc_share                = hc / total_wealth
     implicit_equity_exposure = round(hc_share * beta, 3)
+    sigma_market             = implied_market_volatility(sigma, beta, correlation)
     effective_risk_budget    = round((fc + hc * (1 - sigma)) / total_wealth, 3)
     portfolio_equity_target  = round(effective_risk_budget - implicit_equity_exposure, 3)
 
@@ -131,6 +169,7 @@ def build_profile(persona: dict, discount_rate: float) -> dict:
         "income_volatility_sigma":    sigma,
         "income_equity_beta":         beta,
         "income_equity_correlation":  correlation,
+        "implied_market_volatility":  sigma_market,
         "implicit_equity_exposure":   implicit_equity_exposure,
         "human_capital_type":         hc_type,
         "income_stability":           _STABILITY_TO_CONTRACT[persona["income_stability"]],
