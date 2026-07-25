@@ -310,7 +310,7 @@ The comparison provides a clear, data-driven justification for keeping the curre
 
 ## Pydantic Validation
 
-Field names and types here are the authoritative schema. Any rename must be mirrored in `agents/risk/contracts.py` (MacroContextForRisk) and `agents/allocation/contracts.py` (MacroContextForAllocation). `VALID_REGIME_LABELS` is the single source of truth for regime label strings — no inline string literals elsewhere.
+Field names and types here are the authoritative schema. The root `contracts.py` is the single definition site — the per-agent `contracts.py` files this section used to reference (carrying `MacroContextForRisk` / `MacroContextForAllocation`) no longer exist, and neither do those types; a rename now needs updating only in `contracts.py` and its consumers. `VALID_REGIME_LABELS` is the single source of truth for regime label strings — no inline string literals elsewhere.
 
 ### RegimeRecord — Per-Row Validation
 Every row is validated against `RegimeRecord` before writing to disk. No row with an invalid regime label, out-of-range confidence score, or negative volatility can enter the output JSON.
@@ -482,6 +482,131 @@ FRED is unreachable or the API key is invalid.
 Multiple pipeline workers writing segment fingerprints simultaneously could produce partial writes or corrupt state.
 
 **Mitigation:** `cluster_segments()` is protected by `threading.Lock()`. Input validation raises `ValueError` with descriptive messages before any write occurs if: (a) the input DataFrame is empty, (b) any feature column contains NaN, or (c) fewer than 2 segments are present.
+
+---
+
+## Rebalance Evaluation — Justified or Churn? (Week 9 Deliverable)
+
+Detection alone is not the deliverable. `MacroRegimeSnapshot.regime_change_detected` is a one-line string comparison (`regime_label != prior_regime`) and is **not a trading signal**. `agents/research/rebalance.py` answers the question that matters: should a detected change move the client's book?
+
+### The problem, measured
+
+The smoothed 1995–2025 sequence contains **18 regime runs with a median length of 5 months; 10 of the 18 last 6 months or fewer.** Between 2011-11 and 2013-10 the label flips six times, with runs of 2, 1, 3, 1, 2 and 3 months. A system rebalancing on `regime_change_detected` would have turned the book over six times in twenty months inside what is structurally one stretch of post-GFC normalisation.
+
+### Five gates
+
+Four persona-independent evidence gates, then one persona-conditioned materiality gate. All deterministic; no LLM participates.
+
+| Gate | Test | Threshold |
+|------|------|-----------|
+| `persistence` | months the new label has held | `MIN_DWELL_MONTHS = 3` |
+| `confidence` | mean XGBoost probability across the run | `CONFIDENCE_FLOOR = 0.60` |
+| `structural_break` | a PELT break sits near the shift date | `BREAK_TOLERANCE_MONTHS = 6` |
+| `reversion_base_rate` | how often this transition historically reverted | `MAX_REVERSION_RATE = 0.50` |
+| `materiality` | the client's own equity target actually moves | `MIN_MATERIAL_DELTA = 0.02` |
+
+`structural_break` does the most work. PELT runs on the multivariate signal matrix and never sees the XGBoost labels, so a label flip with no break behind it is a classifier wobble inside a stable macro environment rather than a change of regime. This independence is what makes the gate informative.
+
+`reversion_base_rate` uses the specific prior→current transition when it has at least `MIN_TRANSITION_SAMPLE = 2` prior occurrences, otherwise falls back to the destination regime's short-run frequency, and reports the base rate as unavailable below `MIN_DESTINATION_SAMPLE = 3` prior runs. Without that floor a single short prior run yields a 100% reversion rate and vetoes the March 2008 move into Financial Crisis & ZLB — a transition no one would call churn.
+
+### The regime tilt is derived, not declared
+
+`agents/research/regime_returns.py` sizes the tilt from CRSP value-weighted returns joined to the regime sequence (263 overlapping months):
+
+| Regime | n | ann. mean | SE(mean) | ann. vol | vol ratio | tilt |
+|--------|---|-----------|----------|----------|-----------|------|
+| Early Recovery | 31 | 20.1% | 5.0% | 8.1% | 1.87 | +15.0% (capped) |
+| Late-Cycle Expansion | 61 | 16.7% | 4.6% | 10.5% | 1.44 | +13.3% |
+| Moderate Expansion | 82 | 13.4% | 5.6% | 14.7% | 1.03 | +0.9% |
+| Inflation Shock | 27 | −3.4% | 12.0% | 18.0% | 0.84 | −4.8% |
+| Financial Crisis & ZLB | 62 | 9.5% | 8.9% | 20.1% | 0.75 | −7.5% |
+
+**The tilt uses volatility only, and deliberately ignores the means.** Standard errors of 5–12% straddle almost the entire 23-point spread between the highest and lowest regime mean — the means are not statistically separable. Feeding them into a Merton weight produces w = 9.2 for Early Recovery (920% equity), which is estimation error, not signal. The volatilities *are* separable: Financial Crisis & ZLB realises 2.5× the volatility of Early Recovery. So the tilt holds the risk premium fixed at the full-sample estimate and scales equity by `sigma_base / sigma_regime` — the constant-Sharpe form of volatility targeting — then squashes the result into `±TILT_CAP`. One of five regimes hits the cap, and capping is reported rather than hidden.
+
+### Harness result
+
+`agents/research/rebalance_backtest.py` replays the evaluator over all 16 completed transitions, committing at `DECISION_LAG = 3` months after each shift date and scoring against whether the destination regime went on to hold ≥ 12 months.
+
+| | evaluator | always-act baseline |
+|---|---|---|
+| accuracy | **81.2%** | 31.2% |
+| churn avoided | **90.9%** (10 of 11) | 0% |
+| durable captured | 60.0% (3 of 5) | 100% |
+| precision | **75.0%** | 31.2% |
+| trades taken | **4** | 16 |
+
+The entire 2011–2013 churn cluster is correctly declined. Cost: two durable transitions missed (2003-06 Early Recovery, 2022-01 Inflation Shock) and one false positive (2021-05 Inflation Shock, which lasted 3 months).
+
+**Disclosed leak:** PELT and XGBoost are fitted on the full sample upstream, so the label path and break locations at date *t* embed post-*t* information. The gates themselves are truncated point-in-time in `build_evidence()`, but that upstream leak remains and flatters `structural_break` and `confidence`. These numbers are an upper bound on live performance; a walk-forward refit is future work.
+
+### The corner-solution finding
+
+The materiality gate applies the tilt to the client's own `portfolio_equity_target`, converted from total-wealth to financial-wealth units by `× (financial + human) / financial` and clipped to the achievable [0, 1] portfolio range.
+
+**Every one of the nine current BLS personas sits at a corner.** Human capital is 6–29× financial capital, so a total-wealth target of +0.48 maps to +8.9 in financial units and −0.25 maps to −6.7; both saturate. No regime tilt of any size moves these books — the constraint sets the allocation, not the regime. Regime-conditioned rebalancing only bites once financial capital is comparable to human capital (roughly fc ≳ hc, reached around $2M financial against $2.3M human for the equity-like persona, where the same transition produces a −9.2pp equity move and a JUSTIFIED verdict).
+
+This is a result, not a bug, and it bears directly on the sensitivity question in *Now and Forward* §5: for asset-poor clients the intake precision of income variability cannot move the portfolio, because the portfolio is pinned at a bound regardless.
+
+---
+
+## Ticker Betas (24 Jul action item)
+
+**"Implement beta-calculation routine (no weights) and produce ticker-beta table for review."**
+
+`agents/research/ticker_betas.py` → `data/outputs/ticker_betas.{json,csv}`. Weights are deliberately not computed: the module estimates and reports exposures so beta caps and overlap constraints can be set from measured numbers, and the optimiser stays where it is.
+
+Two regressions per ticker on monthly CRSP total returns, 25 years:
+
+```
+CAPM      r_i − rf = alpha + beta_mkt * (r_m − rf) + e     (Fama-French mktrf)
+vs SPY    r_i − rf = alpha + beta_spy * (r_spy − rf) + e
+```
+
+`beta_spy` and its R² are the direct evidence for review §3 — that the book is diversified by ticker count and not by underlying exposure:
+
+| ticker | n | β_mkt | SE | β_SPY | R²_SPY | resid vol |
+|---|---|---|---|---|---|---|
+| XLK | 300 | 1.248 | 0.041 | 1.281 | 0.745 | 11.5% |
+| IWM | 295 | 1.166 | 0.031 | 1.163 | 0.765 | 9.8% |
+| XLI | 300 | 1.070 | 0.030 | 1.124 | **0.828** | 7.8% |
+| XLY | 300 | 1.068 | 0.035 | 1.113 | 0.769 | 9.4% |
+| XLC | 78 | 0.967 | 0.058 | 1.005 | 0.785 | 9.2% |
+| EFA | 280 | 0.945 | 0.033 | 0.978 | 0.755 | 8.4% |
+
+**7 of 24 holdings sit at R² ≥ 0.70 against SPY.** A sector fund with β_SPY ≈ 1.3 and R² ≈ 0.75 is not adding a risk factor to a book that already holds SPY — it is levering the one already there. XLI at R² 0.83 is the clearest case.
+
+Standard errors are reported next to every beta, because a cap set from a point estimate with a wide standard error is a cap set on noise. `MIN_MONTHS = 36` flags thin histories rather than hiding them — XLC (78 months) and XLRE (110) rest on far less data than SPY's 300.
+
+Two notes for readers of the table. SPY's own `beta_mkt` is 0.954, not 1.0, because `mktrf` is the CRSP value-weighted market — broader than the S&P 500 — so SPY genuinely has slightly less than unit exposure to it. And the bond sleeve prices as expected: TLT −0.107, IEF −0.053, SHY −0.014, all with R² below 0.02, which is the diversification the equity sleeve is not providing.
+
+---
+
+## Regime → Asset-Class Sleeve Tilts (24 Jul decision 5)
+
+The minutes asked to "map each regime to **predefined** asset-class tilts (e.g. increase bond weight in Inflation Shock)". `agents/research/regime_sleeves.py` **derives** them instead — a declared table would be the same unfalsifiable pattern the review objected to in the stress drawdowns. Same construction as the equity tilt: bounded `sigma_baseline / sigma_regime` per sleeve, on equal-weighted monthly CRSP returns for the ETFs in each sleeve.
+
+| sleeve | Early Recovery | Financial Crisis & ZLB | Inflation Shock | Late-Cycle | Moderate Exp. |
+|---|---|---|---|---|---|
+| broad_equity | +0.150 | −0.088 | −0.020 | +0.128 | +0.034 |
+| sector_equity | +0.150 | −0.071 | −0.047 | +0.125 | +0.002 |
+| credit (HYG) | +0.150 | **−0.103** | +0.017 | +0.145 | +0.144 |
+| fixed_income | −0.005 | −0.021 | **−0.089** | +0.017 | +0.081 |
+| real_assets | +0.109 | −0.084 | +0.001 | +0.036 | +0.082 |
+| cash | 0 | 0 | 0 | 0 | 0 |
+
+**The data contradicts the example in the minutes.** Fixed income is the *worst* sleeve in Inflation Shock (−0.089, the most negative tilt in that column), not the shelter. That is economically right — 2022 is in the sample, and bonds fell alongside equities precisely because the shock was inflationary. "Increase bond weight in Inflation Shock" is the intuition a declared table would have encoded, and it would have been wrong.
+
+Two more results worth keeping. **Credit is the most negative sleeve in the crisis** (−0.103, worse than broad equity), which is the correct read on high yield: HYG behaves like equity exactly when a bond sleeve is supposed to help, which is why it is split out of `fixed_income` rather than averaged into it. And **broad and sector equity are kept apart** so the mapping can express a preference between them — review §3 objects to layering one on the other, and a merged sleeve could not say so.
+
+**Cash is held at zero tilt by construction** (`NON_TILTABLE`). BIL has almost no volatility in any regime, so the vol ratio is two near-zero numbers divided — it returned 9.4 in Early Recovery and gave cash a maximum positive tilt in the calmest regime *and* in the financial crisis. That is a divide-by-nearly-zero, not a signal. Cash is sized by the optimiser's cash floor and by what the risky sleeves leave behind.
+
+Each tilt is reported next to the standard error of the mean it rests on, and flagged `mean_supports_tilt` when the return evidence agrees with the volatility evidence by more than one SE. Only 5 of 30 clear that bar — the rest rest on volatility alone, which is not disqualifying but should be visible.
+
+**Scope:** this module produces the mapping only. Consuming it in the optimiser is review §4.2 and lives in `agents/allocation`. `regime_sleeve_tilts()` returns a plain `{regime: {sleeve: tilt}}` dict, also persisted to `data/outputs/regime_sleeve_tilts.json`.
+
+### Consumption
+
+`MacroRegimeSnapshot.regime_change_evidence` carries the persona-independent block and flows into `ComplianceInput` and `AdvisorPackage` automatically. The persona-conditioned verdict comes from `evaluate_rebalance(snapshot, profile, regime_stats)` and is the natural source for `RegimeChangeFlag.rebalance_proposed`, which the contract has always declared and no agent has ever populated.
 
 ---
 

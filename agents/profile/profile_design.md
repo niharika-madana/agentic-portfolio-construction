@@ -454,7 +454,7 @@ The biology professor's bond-like income — a stable, government-indifferent sa
 
 ## Output Schema
 
-`ProfileAgentOutput` is defined in `contracts.py` and validated by four `model_validator` functions. Field names and types here are the authoritative schema — any rename must be mirrored in `agents/risk/contracts.py` (RiskAgentInput) and `agents/research/contracts.py` (ProfileContextForResearch):
+`ProfileAgentOutput` is defined in `contracts.py` and validated by four `model_validator` functions. Field names and types here are the authoritative schema. The root `contracts.py` is the single definition site — the per-agent `contracts.py` files this section used to reference (carrying `RiskAgentInput` / `ProfileContextForResearch`) no longer exist, and neither do those types; a rename now needs updating only in `contracts.py` and its consumers:
 
 1. `_check_holdings_sum` — `current_holdings` weights must sum to 1.0 ± 0.01
 2. `_check_total_wealth_consistency` — `total_wealth == financial_capital + human_capital_valuation` within 0.5%
@@ -570,6 +570,131 @@ FRED is unreachable or the API key is invalid.
 
 ### Holdings Not Summing to 1.0
 `derive_current_holdings()` constructs all allocations arithmetically from a base of 1.0, so this cannot occur from the BLS pipeline. Only possible if holdings are set manually. Caught by `_check_holdings_sum` Pydantic validator before the profile exits the agent.
+
+---
+
+## Beta Calibration — One Market (resolves 24 Jul review §7)
+
+**Was:** σ, β and ρ were each calibrated independently, so inverting the single-factor identity `β = ρ × σ_income / σ_market` implied three different market volatilities — 10.0%, 22.9% and 33.3%. One model claiming three markets.
+
+**Now:** σ_market is measured once and β is derived from it. `SIGMA_MARKET = 0.1571` is the annualised standard deviation of the Fama-French excess market return (`mktrf`), 312 monthly observations, 2000-01 to 2025-12 — the same factor and file `agents/research/ticker_betas.py` regresses against, so human-capital beta and asset beta are denominated in one market. `measure_market_volatility()` recomputes it from the parquet.
+
+| HC type | ρ | σ_income | β (was) | β (now) |
+|---|---|---|---|---|
+| bond-like | 0.10 | 0.05 | 0.05 | **0.032** |
+| mixed | 0.40 | 0.20 | 0.35 | **0.509** |
+| equity-like | 0.75 | 0.40 | 0.90 | **1.910** |
+
+β is now computed in the table comprehension, never hand-set, so the identity holds by construction and cannot drift again. `implied_market_volatility` changes meaning: it was a diagnostic that exposed the inconsistency, and is now a consistency check that must round-trip to ≈0.157 for every profile.
+
+**Downstream impact.** No persona changes human-capital type or corner status; magnitudes move. Equity-like `portfolio_equity_target` goes from −0.25 to −1.22 (already at the zero bound, stays there); mixed from 0.48 to 0.33; bond-like from 0.92 to 0.93.
+
+**Consequence worth flagging:** equity-like β now sits at 1.91 against the contract's 2.0 ceiling, so a +10% extraction error on σ_income or ρ leaves the admissible range entirely. Twelve sensitivity cells are unmeasurable for that reason. Either the ceiling or `σ_income = 0.40` needs revisiting.
+
+---
+
+## Intake Layer — Transcript to Typed Profile
+
+The 'extract' half of the standing rule (LLMs extract, classify, narrate; deterministic code computes). Nothing here produces a portfolio number — it produces what the client *said*, typed and sourced, which `build_profile()` then computes on.
+
+**Contracts** (`contracts.py`): `FactSource` (STATED / INFERRED / DEFAULT / UNKNOWN), `ExtractedField`, `ExtractedProfile`. Validators make the failure modes unconstructable rather than merely discouraged — a STATED field without an `evidence_quote` raises, and an UNKNOWN field carrying a value or lacking a `follow_up_question` raises.
+
+**`transcript_generator.py`** — synthetic discovery calls rendered *from* ground-truth personas by deterministic templating. The answer key is the input that produced the transcript, not something recovered from it afterwards, so no extractor can score well by sharing a prior with the generator. Facts are planted at four salience levels (prominent / mentioned / parenthetical / omitted); omitted fields are the refusal-to-guess tests. One fact is planted as an advisor-supplied estimate the client merely assents to, recorded `is_stated=False` — the mentor's point about Priya's beta of 1.2.
+
+**`intake.py`** — three extractors behind one protocol: `RuleBasedExtractor` (deterministic, offline, the floor the LLMs must beat), `NaiveExtractor` (one call, flat output — the control asked for directly), `StructuredExtractor` (field-by-field, provenance, explicit unknown, stated confidence). `call_model` is a thin swappable backend per the 14 Jul minutes; it raises rather than silently degrading when no key is set.
+
+**`intake_eval.py`** — scores any extractor on the five properties from *Now and Forward* §4. Provenance is *verified* against the transcript, not trusted: a quote the model composed rather than copied fails.
+
+### Harness result — the naive-vs-designed comparison
+
+18 transcripts / 9 personas, extraction on `claude-opus-5`, 0 failures.
+
+| metric | rule_based | naive | **structured** |
+|---|---|---|---|
+| overall accuracy | 90.3% | 74.5% | **98.6%** |
+| recall: prominent | 91.7% | 97.2% | 91.7% |
+| recall: mentioned | 76.3% | 100% | 100% |
+| recall: parenthetical | 100% | 100% | 100% |
+| provenance (has quote) | 100% | 0% | 100% |
+| quote verified | 86.2% | 0% | **100%** |
+| stated vs inferred | 100% | 12.2% | 87.8% |
+| refusal recall | 100% | **2.9%** | 100% |
+| hallucination rate | 0% | **97.1%** | **0%** |
+| calibration error | 13.4% | 24.3% | **6.2%** |
+
+**The design earns its complexity, and the margin is not subtle.** Structured beats the single-call control by 24 points of overall accuracy, and the decisive number is refusal: asked about a field the client never discussed, the naive extractor invents a plausible value **97.1%** of the time. The structured extractor does it **0%** of the time — it returns `unknown` with a follow-up question instead. For a suitability file that difference is the whole ballgame, because a fabricated liquidity need or horizon is indistinguishable from a real one once it reaches the optimiser.
+
+Two secondary results worth keeping:
+
+- **Naive cannot separate what the client said from what the advisor said** (stated-vs-inferred 12.2%). The transcripts plant an advisor-supplied beta the client merely assents to — the mentor's Priya beta-1.2 point — and the naive extractor records it as the client's own assertion.
+- **Only the structured extractor is calibrated** (6.2% error). Its 0.8–1.0 confidence bucket is 100% accurate against a stated 0.95, so its confidence can actually be used as a routing signal.
+
+The rule-based floor is respectable (90.3%) and remains the offline default, but it plateaus where regex does: 76.3% recall on single-mention facts, and 86.2% quote verification because its cue-window slices don't always land on a verbatim span.
+
+**Two harness bugs were found and fixed while producing this table**, both of which had penalised all three extractors equally and hidden the real differences:
+
+1. Categorical fields (`income_stability` et al.) had no value space in the prompt, so extractors returned semantically correct prose — "stable base salary but unpredictable bonus" — that an exact-match scorer must reject. Fixed by `FIELD_VALUE_SPACE` in `intake.py`; the constraint is now stated in both prompts.
+2. The answer key recorded the persona's unrounded `bonus_rate` (0.046) while the transcript said "around 5%". The key now records **what the transcript says**, since 4.6% is not recoverable from the conversation and grading against it penalises correct reading.
+
+Reproduce with `python -m agents.profile.intake_eval`. Sweep cost/quality with `INTAKE_MODEL=claude-haiku-4-5 python -m agents.profile.intake_eval` — same harness, same scoring, different backend.
+
+### The bridge — transcript actually drives the pipeline
+
+`intake_bridge.py` converts an `ExtractedProfile` into a persona dict and runs it through the **same `build_profile()`** the BLS personas use. Without it the intake layer was a dead end: measured carefully, connected to nothing — the review's own "a stage computes something correct and the next stage never receives it", reproduced inside this agent.
+
+All 9 synthetic conversations now produce validated `ProfileAgentOutput`s, and they reproduce the BLS-built profiles: identical β and equity target, with human capital differing only by the bonus rounding the transcript introduces (1,099,343 vs 1,095,155 for the biology professor — the client says "around 5%", the persona holds 4.6%).
+
+**Which source wins — the answer to the oral question.** *"If the client's own words disagree with what your data says about them, which wins, and why?"*
+
+| Kind of fact | Winner | Why |
+|---|---|---|
+| Situation — age, salary, balances, employer | **Client** | They are the authority on their own circumstances; no table knows their account balance |
+| Model parameters — β, ρ, σ | **Measured calibration** | These are estimated, not observed. A transcript β is rarely the client's measurement |
+| Never discussed, defaultable | Neither — **defaulted and listed** | A suitability file must separate what the client asserted from what the system chose |
+| Never discussed, not defaultable | **Nothing is built** | `REQUIRED_FIELDS` cannot be guessed without inventing the client |
+
+The parameter rule is the interesting one. In the reference intake the *advisor* proposed β = 1.2 and the client merely assented, hedging it might be low in a bad year. Soft assent to someone else's estimate is not evidence, and letting it overwrite a calibrated parameter launders an opinion into a number the optimiser treats as fact. So the calibration is used — **and the disagreement is recorded rather than discarded**:
+
+```
+CONFLICT: income_equity_beta: transcript says 0.80 (advisor-supplied, client
+assented); calibration derives 0.032 from income_stability='High'. Calibration
+used — the transcript figure is an estimate, not a measurement. Flag for
+advisor review.
+```
+
+Refusal carries through the layer too. A transcript that never mentions salary or balances returns `profile=None` and the follow-up questions, rather than defaulting its way to a fabricated client — it would be strange for the extractor to honestly decline and the bridge to invent the same value one layer down.
+
+**Entry point.** The transcript path is exposed on the agent itself, not just as an importable helper:
+
+```python
+run_profile_agent(transcripts={client_id: text, ...})           # conversations
+run_profile_agent(transcripts=..., extractor=StructuredExtractor())  # LLM path
+run_profile_agent()                                             # BLS, unchanged default
+```
+
+`build_profiles_from_transcripts()` returns `(profiles, results)` — the second element carries one `BridgeResult` per conversation **including the ones that produced no profile**, so callers can surface the follow-up questions. A conversation that did not build is a client to go back to, not an error to swallow.
+
+---
+
+## Input Sensitivity — How Far Does an Extraction Error Travel?
+
+`sensitivity.py` answers *Now and Forward* §5. Perturb an intake-extractable field ±10/20%, rebuild the profile through the real formulas, re-run the real allocation agent, measure the move. 132 cells measured, 12 skipped as out-of-contract.
+
+At ±20% input error, max |Δ equity share|:
+
+| field | max Δ | bond-like | mixed | equity-like |
+|---|---|---|---|---|
+| income_volatility_sigma | **13.5pp** | 1.5pp | 13.5pp | 0 |
+| income_equity_correlation | 9.7pp | 0.6pp | 9.7pp | 0 |
+| annual_salary | 1.4pp | 0.2pp | 1.4pp | 0 |
+| financial_capital | 1.3pp | 0.3pp | 1.3pp | 0 |
+
+Against the mentor's own scale — 1% means extraction precision is not binding, 15% means the intake layer is the bottleneck — **σ_income sits at the bottleneck end for mixed personas and at the irrelevant end for everyone else.** The answer is persona-dependent, which is itself the result.
+
+Two caveats that change the reading:
+
+1. Turnover must be measured on the **assembled** book (`risky_weight × sleeve + safe_weight × safe`). Measured on `proposed_portfolio` alone it is 0.0 for every perturbation even when equity share moves 13 points, because that field is sleeve-relative — a direct symptom of review §4.1.
+2. Once §4.1's unit conversion is fixed, **all 132 cells sit at a corner solution** and stop responding to intake error entirely. The moves above are what the *current* engine does. After the fix, a bound rather than the input sets these allocations.
 
 ---
 

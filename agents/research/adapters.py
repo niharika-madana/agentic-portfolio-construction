@@ -123,16 +123,40 @@ def build_regime_sequence(features_df: pd.DataFrame) -> dict[str, dict]:
     return regime_sequence
 
 
-def build_snapshot(features_df: pd.DataFrame) -> MacroRegimeSnapshot:
+def build_snapshot(
+    features_df: pd.DataFrame,
+    break_dates: list | None = None,
+) -> MacroRegimeSnapshot:
     """
     Build the most-recent-month MacroRegimeSnapshot (contracts.py) for the
     orchestrator. is_low_confidence and regime_change_detected are derived by
     the contract's validator.
+
+    When `break_dates` (the PELT structural breaks from detect_change_points) is
+    supplied, the snapshot also carries regime_change_evidence — the four
+    persona-independent gates that decide whether a detected change is worth
+    acting on. Without the breaks the structural_break gate cannot be evaluated,
+    so the evidence block is omitted rather than half-filled.
     """
     last_date = features_df.index[-1]
     row = features_df.loc[last_date]
 
+    evidence = None
+    if break_dates is not None:
+        from agents.research.rebalance import build_evidence
+
+        evidence = build_evidence(
+            labels            = features_df["regime_label_smoothed"],
+            confidence        = features_df["regime_confidence"],
+            break_dates       = list(break_dates),
+            regime_label      = row["regime_label_smoothed"],
+            prior_regime      = row["prior_regime"],
+            regime_shift_date = pd.Timestamp(row["regime_shift_date"]).date(),
+            as_of             = pd.Timestamp(last_date).date(),
+        )
+
     return MacroRegimeSnapshot(
+        regime_change_evidence = evidence,
         as_of             = pd.Timestamp(last_date).date(),
         regime_label      = row["regime_label_smoothed"],
         prior_regime      = row["prior_regime"],

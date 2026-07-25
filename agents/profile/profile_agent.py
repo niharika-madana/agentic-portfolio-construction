@@ -111,10 +111,62 @@ def save_profiles(outputs: list[ProfileAgentOutput]) -> None:
         print(f"Parquet export skipped ({e}); JSON output is authoritative.")
 
 
+def build_profiles_from_transcripts(
+    transcripts:   dict[str, str],
+    discount_rate: float,
+    extractor=None,
+) -> tuple[list[ProfileAgentOutput], list]:
+    """
+    Build profiles from client conversations instead of BLS occupation data.
+
+    This is the "input should stop being a JSON file" path. Extraction is an
+    LLM (or regex) job; every number in the returned profiles is still computed
+    by build_profile() from the extracted inputs.
+
+    Parameters
+    ----------
+    transcripts : dict[str, str]
+        client_id → raw transcript text.
+    extractor : Extractor | None
+        Defaults to RuleBasedExtractor, which needs no API key. Pass
+        StructuredExtractor() for the language-model path.
+
+    Returns
+    -------
+    (profiles, results)
+        `results` carries one BridgeResult per transcript, including the
+        conversations that could NOT be built and the questions to ask before
+        retrying. Callers should surface those rather than dropping them —
+        a conversation that produced no profile is a client to follow up with,
+        not an error to swallow.
+    """
+    from agents.profile.intake import RuleBasedExtractor
+    from agents.profile.intake_bridge import build_profile_from_intake
+
+    extractor = extractor or RuleBasedExtractor()
+
+    profiles: list[ProfileAgentOutput] = []
+    results = []
+    for client_id, text in transcripts.items():
+        extracted = extractor.extract(text, client_id, f"transcript_{client_id}")
+        result = build_profile_from_intake(extracted, discount_rate)
+        results.append(result)
+        if result.built:
+            profiles.append(result.profile)
+        else:
+            print(f"SKIP {client_id}: {len(result.open_questions)} required field(s) "
+                  f"never discussed — {result.open_questions}")
+
+    print(f"Built {len(profiles)} / {len(transcripts)} profiles from transcripts")
+    return profiles, results
+
+
 def run_profile_agent(
     fred_api_key: str | None = None,
     include_percentile_variants: bool = False,
     save: bool = True,
+    transcripts: dict[str, str] | None = None,
+    extractor=None,
 ) -> list[ProfileAgentOutput]:
     """
     End-to-end Profile Agent run.
@@ -128,6 +180,14 @@ def run_profile_agent(
         False (default) → 9 personas at p50; True → up to 27 (p25/p50/p75).
     save : bool
         Persist JSON + parquet outputs when True.
+    transcripts : dict[str, str] | None
+        client_id → raw discovery-call text. When supplied, profiles are built
+        from the conversations instead of the BLS occupation table — the intake
+        path from *Now and Forward* §2. BLS remains the default so existing
+        callers are unaffected.
+    extractor : Extractor | None
+        Extraction strategy for the transcript path; defaults to the offline
+        RuleBasedExtractor. Ignored when `transcripts` is None.
 
     Returns
     -------
@@ -136,11 +196,16 @@ def run_profile_agent(
     discount_rate = _get_discount_rate(fred_api_key)
     print(f"Discount rate (FRED DGS10): {discount_rate:.4f}")
 
-    oes_df = _load_bls_oes()
-    raw_personas = build_bls_personas(
-        oes_df, include_percentile_variants=include_percentile_variants
-    )
-    outputs = build_profiles(raw_personas, discount_rate)
+    if transcripts:
+        outputs, _ = build_profiles_from_transcripts(
+            transcripts, discount_rate, extractor=extractor
+        )
+    else:
+        oes_df = _load_bls_oes()
+        raw_personas = build_bls_personas(
+            oes_df, include_percentile_variants=include_percentile_variants
+        )
+        outputs = build_profiles(raw_personas, discount_rate)
 
     if save:
         save_profiles(outputs)

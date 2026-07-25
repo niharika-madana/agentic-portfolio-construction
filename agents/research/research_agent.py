@@ -97,6 +97,32 @@ def _validate_crsp(features_df) -> None:
     print(summary.to_string())
 
 
+def _print_regime_stability(features_df) -> None:
+    """
+    Print the run-length distribution behind the rebalance evaluator.
+
+    This is the evidence for the Week 9 deliverable: the smoothed label path is
+    far noisier than it looks from a single snapshot, so regime_change_detected
+    on its own is not a trading signal.
+    """
+    from agents.research.rebalance import regime_runs
+
+    runs = regime_runs(features_df["regime_label_smoothed"])
+    if not runs:
+        return
+
+    lengths = sorted(r.months for r in runs)
+    median = lengths[len(lengths) // 2]
+    short = sum(1 for m in lengths if m <= 6)
+
+    print("\n=== Regime stability (rebalance evidence) ===")
+    print(f"{len(runs)} runs | median length {median} months | {short} of {len(runs)} last <= 6 months")
+    for r in runs:
+        marker = "  <-- churn-length run" if r.months <= 6 else ""
+        print(f"  {r.start.strftime('%Y-%m')} → {r.end.strftime('%Y-%m')}  "
+              f"{r.label:24s} {r.months:3d} mo{marker}")
+
+
 def _save_outputs(features_df, regime_sequence: dict, snapshot: MacroRegimeSnapshot) -> None:
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -157,6 +183,11 @@ def run_research_agent(
     macro_df = _load_macro_data(fred_api_key)
     features_df, signal_cols = build_features(macro_df)
 
+    # break_dates feeds two consumers: the diagnostic clustering below, and the
+    # structural_break evidence gate in the rebalance evaluator. The gate is
+    # informative precisely because PELT works on the signal matrix and never
+    # sees the XGBoost labels — a label flip with no break behind it is a
+    # classifier wobble, not a change of regime.
     break_dates, _ = detect_change_points(features_df, signal_cols, pen=pen, model=pelt_model)
     # Diagnostic sanity check only — also gates on empty/NaN/out-of-range inputs.
     # Its return value is intentionally not consumed; XGBoost labels the full
@@ -171,10 +202,12 @@ def run_research_agent(
     add_derived_fields(features_df)
 
     regime_sequence = build_regime_sequence(features_df)
-    snapshot = build_snapshot(features_df)
+    snapshot = build_snapshot(features_df, break_dates=break_dates)
 
     print("\n=== MacroRegimeSnapshot (most recent month) ===")
     print(snapshot.model_dump_json(indent=2))
+
+    _print_regime_stability(features_df)
 
     if compare_models:
         from agents.research.model_comparison import compare_models as _cmp

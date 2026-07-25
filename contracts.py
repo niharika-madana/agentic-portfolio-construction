@@ -97,6 +97,21 @@ class MarketRegime(str, Enum):
     CRISIS   = "crisis"    # ratio ≥ 2.0 (2008/COVID-scale)    — caps widened 50%
 
 
+class RebalanceDecision(str, Enum):
+    """
+    Verdict on whether a detected regime change should move the client's book.
+
+    A regime label flip is not by itself a reason to trade. The Research Agent's
+    rebalance evaluator (agents/research/rebalance.py) runs four persona-independent
+    evidence gates plus one persona-conditioned materiality gate before answering.
+    Declining to trade on noise is a result, not a failure.
+    """
+    NO_CHANGE            = "no_change"             # regime_label == prior_regime; nothing to evaluate
+    JUSTIFIED            = "justified"             # evidence gates pass AND the move is material for this client
+    CHURN                = "churn"                 # change detected but not worth trading on
+    INSUFFICIENT_HISTORY = "insufficient_history"  # too few observations to judge; fail loud rather than pass silently
+
+
 class ConstraintType(str, Enum):
     SINGLE_NAME          = "single_name"
     SECTOR               = "sector"
@@ -133,6 +148,121 @@ class ResponsibleAgent(str, Enum):
     RISK       = "risk_agent"
     COMPLIANCE = "compliance_agent"
     UNKNOWN    = "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Agent 1 — Profile Agent intake (transcript → typed profile)
+# ---------------------------------------------------------------------------
+
+class FactSource(str, Enum):
+    """
+    Where a field's value came from. Kept distinct because merging them destroys
+    the one thing suitability review needs: which constraints the client actually
+    asserted, versus which the system decided on their behalf.
+
+    "I'm 47" is STATED. "Your horizon is 16 years" is INFERRED.
+    """
+    STATED   = "stated"    # the client said it; evidence_quote is mandatory
+    INFERRED = "inferred"  # derived from something the client said
+    DEFAULT  = "default"   # population default; the client never addressed it
+    UNKNOWN  = "unknown"   # never discussed and must not be guessed
+
+
+class ExtractedField(BaseModel):
+    """
+    One field pulled from a client conversation, with its provenance.
+
+    For a fiduciary system, provenance is close to mandatory: you must be able to
+    show a client the sentence that produced a number in their recommendation.
+    The validators below make an unsourced STATED field, or a guessed UNKNOWN
+    field, impossible to construct rather than merely discouraged.
+    """
+
+    name:  str
+    value: Optional[float | str | bool] = Field(
+        default=None, description="None whenever source is UNKNOWN"
+    )
+    source:     FactSource
+    confidence: float = Field(
+        ge=0, le=1,
+        description="Extractor's stated confidence. Checked for calibration by intake_eval.py",
+    )
+    evidence_quote: Optional[str] = Field(
+        default=None,
+        description="Verbatim span from the transcript that supports the value",
+    )
+    evidence_line: Optional[int] = Field(
+        default=None, ge=0,
+        description="0-indexed transcript line the quote came from, for verification",
+    )
+    follow_up_question: Optional[str] = Field(
+        default=None,
+        description="What to ask the client. Mandatory when source is UNKNOWN.",
+    )
+
+    @model_validator(mode="after")
+    def _check_provenance(self) -> "ExtractedField":
+        if self.source == FactSource.STATED:
+            if not self.evidence_quote:
+                raise ValueError(
+                    f"'{self.name}' is marked STATED but carries no evidence_quote; "
+                    "a stated fact must point at the sentence that produced it"
+                )
+            if self.value is None:
+                raise ValueError(f"'{self.name}' is STATED but has no value")
+
+        if self.source == FactSource.UNKNOWN:
+            if self.value is not None:
+                raise ValueError(
+                    f"'{self.name}' is UNKNOWN but carries value {self.value!r} — "
+                    "an undiscussed field must not be guessed"
+                )
+            if not self.follow_up_question:
+                raise ValueError(
+                    f"'{self.name}' is UNKNOWN but proposes no follow_up_question; "
+                    "the system must say what it needs to ask"
+                )
+            if self.confidence != 0.0:
+                raise ValueError(
+                    f"'{self.name}' is UNKNOWN but reports confidence "
+                    f"{self.confidence}; it must be 0.0"
+                )
+        return self
+
+
+class ExtractedProfile(BaseModel):
+    """
+    The typed output of the intake layer — the 'extract' half of the standing
+    rule that language models extract, classify and narrate while deterministic
+    code computes.
+
+    Nothing here is a portfolio number. This is what the client said, typed and
+    sourced; ProfileAgentOutput is what the deterministic formulas make of it.
+    """
+
+    client_id:      str
+    transcript_id:  str = Field(description="Identifies the source conversation")
+    extractor:      str = Field(description="Which extraction strategy produced this")
+    fields:         dict[str, ExtractedField]
+
+    @property
+    def unresolved(self) -> list[str]:
+        """Field names the extractor declined to guess."""
+        return sorted(
+            name for name, f in self.fields.items() if f.source == FactSource.UNKNOWN
+        )
+
+    @property
+    def stated(self) -> list[str]:
+        """Field names the client asserted themselves."""
+        return sorted(
+            name for name, f in self.fields.items() if f.source == FactSource.STATED
+        )
+
+    def value_of(self, name: str):
+        """Value for `name`, or None when absent or unknown."""
+        field = self.fields.get(name)
+        return field.value if field else None
 
 
 # ---------------------------------------------------------------------------
@@ -211,15 +341,17 @@ class ProfileAgentOutput(BaseModel):
     implied_market_volatility: Optional[float] = Field(
         default=None, ge=0, le=1,
         description=(
-            "DIAGNOSTIC ONLY — no downstream agent should consume this. "
+            "INTERNAL CONSISTENCY CHECK — no downstream agent consumes this; it exists "
+            "so the calibration can be audited, not to be traded on. "
             "σ_market implied by inverting the single-factor identity: "
             "σ_market = income_equity_correlation × income_volatility_sigma / income_equity_beta. "
-            "σ, β and ρ are calibrated independently from separate sources for separate "
-            "purposes, so this does NOT resolve to one common market volatility across "
-            "human-capital types (bond-like 10%, mixed ≈23%, equity-like ≈33%). That spread "
-            "is the finding: the calibration is pragmatic, not a strict econometric model. "
-            "Deliberately unvalidated — a cross-check against the identity would fail every "
-            "profile. None when income_equity_beta ≤ 0, where the identity is undefined."
+            "Since the 24 Jul review, income_equity_beta is DERIVED from ρ, σ_income and a "
+            "single measured SIGMA_MARKET (0.1571 — annualised Fama-French mktrf, 312 months, "
+            "2000-2025), so this must round-trip to ≈0.157 for every profile regardless of "
+            "human-capital type. It previously returned 10% / 23% / 33% across the three types, "
+            "which was one model claiming three different markets. A value away from 0.157 now "
+            "means HC_BETA_TABLE has been hand-edited back out of consistency. "
+            "None when income_equity_beta ≤ 0, where the identity is undefined."
         )
     )
     implicit_equity_exposure: float = Field(
@@ -326,6 +458,143 @@ class ProfileAgentOutput(BaseModel):
 # Agent 2 — Research Agent output
 # ---------------------------------------------------------------------------
 
+class RegimeChangeEvidence(BaseModel):
+    """
+    Persona-independent evidence that a detected regime change is structural
+    rather than classifier noise. Built by agents/research/rebalance.py from the
+    regime sequence, the PELT break dates, and the XGBoost confidence path.
+
+    Motivation: the 1995-2025 smoothed sequence contains 18 regime runs with a
+    median length of 5 months, and 10 of them last 6 months or less. Six label
+    flips occur between 2011-11 and 2013-10 alone. Rebalancing on
+    regime_change_detected would have traded the book on every one of them.
+
+    Every field is computed deterministically — no LLM involvement.
+    """
+
+    months_in_regime: int = Field(
+        ge=0,
+        description="Consecutive months the current label has held, as of the snapshot date",
+    )
+    min_dwell_months: int = Field(
+        gt=0, description="Persistence threshold the run must clear to be actionable"
+    )
+    run_confidence: float = Field(
+        ge=0, le=1,
+        description="Mean XGBoost class probability across the current regime run",
+    )
+    pelt_corroborated: bool = Field(
+        description=(
+            "True when a PELT structural break falls within the tolerance window of "
+            "regime_shift_date. A label flip with no break behind it is a classifier "
+            "wobble in a stable macro environment, not a change of regime."
+        )
+    )
+    months_to_nearest_break: Optional[int] = Field(
+        default=None,
+        description="Distance in months from regime_shift_date to the nearest PELT break; None when no breaks exist",
+    )
+    historical_reversion_rate: Optional[float] = Field(
+        default=None, ge=0, le=1,
+        description=(
+            "Fraction of past occurrences of this exact prior→current transition that "
+            "reverted to the prior regime within the reversion window. None when the "
+            "transition has never been observed before."
+        )
+    )
+    transition_sample_size: int = Field(
+        ge=0, description="Number of past occurrences of this transition in the sequence"
+    )
+    gates_passed: list[str] = Field(
+        default_factory=list, description="Names of the evidence gates that passed"
+    )
+    gates_failed: list[str] = Field(
+        default_factory=list, description="Names of the evidence gates that failed"
+    )
+
+    @property
+    def evidence_supports_change(self) -> bool:
+        """True when every evidence gate passed."""
+        return not self.gates_failed
+
+
+class RebalanceEvaluation(BaseModel):
+    """
+    The Week 9 deliverable: given a detected regime change, is rebalancing this
+    client's portfolio justified, or is it churn?
+
+    Persona-conditioned. The same regime change can be justified for one client
+    and churn for another, because the evidence gates are shared but the
+    materiality gate is not: the regime tilt is applied to the client's own
+    portfolio_equity_target. A client whose career already consumes their entire
+    equity budget (high implicit_equity_exposure) has a target near zero, so no
+    regime tilt moves their book enough to pay for the turnover.
+
+    `explanation` is templated from the computed fields by deterministic code.
+    It is not LLM-generated — this object is an input to compliance, not prose.
+    """
+
+    client_id:      str
+    prior_regime:   str
+    current_regime: str
+    decision:       RebalanceDecision
+
+    evidence: RegimeChangeEvidence
+
+    # ── Materiality (persona-conditioned) ─────────────────────────────
+    current_equity_target: float = Field(
+        description="The client's portfolio_equity_target under the prior regime, in financial-wealth units"
+    )
+    proposed_equity_target: float = Field(
+        description="Equity target under the current regime = current × (1 + regime tilt)"
+    )
+    equity_target_delta: float = Field(
+        description="proposed − current. Signed; negative is de-risking. The size of the trade being proposed."
+    )
+    materiality_threshold: float = Field(
+        gt=0,
+        description="Minimum |equity_target_delta| worth trading on, net of turnover cost",
+    )
+    is_material: bool = Field(
+        description="True when |equity_target_delta| >= materiality_threshold"
+    )
+
+    explanation: str = Field(
+        description="Deterministically templated summary of which gates fired and why"
+    )
+
+    @model_validator(mode="after")
+    def _check_delta_consistent(self) -> "RebalanceEvaluation":
+        expected = self.proposed_equity_target - self.current_equity_target
+        if abs(expected - self.equity_target_delta) > 1e-6:
+            raise ValueError(
+                f"equity_target_delta {self.equity_target_delta:.6f} != "
+                f"proposed ({self.proposed_equity_target:.6f}) − "
+                f"current ({self.current_equity_target:.6f}) = {expected:.6f}"
+            )
+        if self.is_material != (abs(self.equity_target_delta) >= self.materiality_threshold):
+            raise ValueError(
+                f"is_material {self.is_material} is inconsistent with "
+                f"|delta| {abs(self.equity_target_delta):.6f} vs threshold {self.materiality_threshold:.6f}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_decision_consistent(self) -> "RebalanceEvaluation":
+        """JUSTIFIED requires both the evidence gates and the materiality gate."""
+        if self.decision == RebalanceDecision.JUSTIFIED:
+            if not self.evidence.evidence_supports_change:
+                raise ValueError(
+                    f"decision JUSTIFIED but evidence gates failed: {self.evidence.gates_failed}"
+                )
+            if not self.is_material:
+                raise ValueError(
+                    f"decision JUSTIFIED but equity target moves only "
+                    f"{self.equity_target_delta:+.4f} (threshold {self.materiality_threshold:.4f})"
+                )
+        return self
+
+
 class MacroRegimeSnapshot(BaseModel):
     """
     Single-date regime snapshot extracted from the Research Agent's
@@ -355,6 +624,18 @@ class MacroRegimeSnapshot(BaseModel):
     # ── Derived flags (set automatically by validator) ────────────────
     is_low_confidence:      bool = Field(default=False, description="True when regime_confidence < 0.60")
     regime_change_detected: bool = Field(default=False, description="True when regime_label != prior_regime")
+
+    # ── Rebalance evidence (Week 9 deliverable) ───────────────────────
+    regime_change_evidence: Optional[RegimeChangeEvidence] = Field(
+        default=None,
+        description=(
+            "Persona-independent evidence on whether the detected change is structural. "
+            "regime_change_detected answers 'did the label move?'; this answers 'should "
+            "anyone care?'. Pair with agents.research.rebalance.evaluate_rebalance(snapshot, "
+            "profile) to get the persona-conditioned RebalanceEvaluation. Optional: None when "
+            "the snapshot is built without the regime sequence and PELT breaks in hand."
+        ),
+    )
 
     @model_validator(mode="after")
     def _set_derived_flags(self) -> "MacroRegimeSnapshot":

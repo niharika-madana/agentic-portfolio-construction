@@ -40,35 +40,74 @@ HUMAN_CAPITAL_TYPE = {
     "Low":    "equity-like",
 }
 
-# Calibrated β and ρ per HC type.
-# β = income_equity_beta  — systematic sensitivity of income to equities
-# ρ = income_equity_correlation
-#
-# ── Known calibration inconsistency (14 Jul 2026 review) ───────────────────
-# σ (INCOME_VOLATILITY_SIGMA), β, and ρ are each calibrated independently from
-# a different literature source, for a different downstream purpose:
-#   σ → effective_risk_budget;  β → implicit_equity_exposure;  ρ → Risk Agent's
-#   HC-adjusted sector limits.
-# They are NOT jointly estimated. So the single-factor identity
-#   β = ρ × σ_income / σ_market   ⇒   σ_market = ρ × σ_income / β
-# does not resolve to one common market volatility across the three tiers:
-#   bond-like:   0.10 × 0.05 / 0.05 = 10.0%
-#   mixed:       0.40 × 0.20 / 0.35 ≈ 22.9%
-#   equity-like: 0.75 × 0.40 / 0.90 ≈ 33.3%
-# A single-factor model would require all three to equal one σ_market (~16-20%
-# for US equities). The spread is the honest reading: this table is a pragmatic
-# calibration, not a strict econometric model.
-# Surfaced per-profile as implied_market_volatility (see below) so the
-# discrepancy is visible and auditable rather than hidden. Left uncorrected on
-# purpose — retuning β or ρ to force consistency would shift
-# implicit_equity_exposure and therefore portfolio_equity_target for every
-# persona, changing all downstream allocations. That is a team decision, not a
-# side effect of adding the diagnostic.
-HC_BETA_TABLE = {
-    "bond-like":   {"beta": 0.05, "correlation": 0.10},
-    "mixed":       {"beta": 0.35, "correlation": 0.40},
-    "equity-like": {"beta": 0.90, "correlation": 0.75},
+# Correlation of income shocks with equity returns, ρ, per HC type.
+# Calibrated from the literature; the primitive input, not derived.
+HC_CORRELATION = {
+    "bond-like":   0.10,
+    "mixed":       0.40,
+    "equity-like": 0.75,
 }
+
+# ── Market volatility, measured (resolves 24 Jul review §7) ────────────────
+# Previously σ, β and ρ were each calibrated independently, so the single-factor
+# identity β = ρ × σ_income / σ_market implied three different market
+# volatilities (10.0%, 22.9%, 33.3%) — one model claiming three markets. The
+# review's instruction was to pick one and derive the betas from it.
+#
+# σ_market is now measured, not asserted: the annualised standard deviation of
+# the Fama-French excess market return (mktrf), 312 monthly observations,
+# 2000-01 to 2025-12, from data/storage/ff_risk_factors.parquet. Same factor and
+# same file the ticker betas in agents/research/ticker_betas.py regress against,
+# so human-capital beta and asset beta are now denominated in one market.
+#
+# Held as a constant rather than read at import so profile construction stays
+# deterministic and file-free; measure_market_volatility() recomputes it from
+# the parquet to verify or refresh.
+SIGMA_MARKET = 0.1571
+
+# β is DERIVED, never hand-set: β = ρ × σ_income / σ_market. The identity now
+# holds by construction and cannot drift out of agreement again.
+#
+#   bond-like:    0.10 × 0.05 / 0.1571 = 0.032
+#   mixed:        0.40 × 0.20 / 0.1571 = 0.509
+#   equity-like:  0.75 × 0.40 / 0.1571 = 1.910
+#
+# The equity-like row lands at 1.91, near the contract's 2.0 ceiling. That is a
+# direct consequence of σ_income = 0.40 for RSU/commission income: a career with
+# 40% earnings volatility and 0.75 correlation to equities genuinely carries
+# close to 2x market exposure. The number is now a consequence of two calibrated
+# inputs rather than a third independent guess, which is the point of the fix.
+HC_BETA_TABLE = {
+    hc_type: {
+        "beta":        round(rho * INCOME_VOLATILITY_SIGMA[stability] / SIGMA_MARKET, 4),
+        "correlation": rho,
+    }
+    for stability, hc_type in HUMAN_CAPITAL_TYPE.items()
+    for rho in (HC_CORRELATION[hc_type],)
+}
+
+
+def measure_market_volatility(
+    factor_parquet: str | None = None, factor: str = "mktrf"
+) -> float:
+    """
+    Recompute σ_market from the Fama-French factor cache.
+
+    Returns the annualised standard deviation of the monthly excess market
+    return. Use to verify or refresh SIGMA_MARKET; not called at import, so a
+    missing cache never breaks profile construction.
+    """
+    from pathlib import Path
+
+    import numpy as np
+    import pandas as pd
+
+    path = Path(factor_parquet) if factor_parquet else (
+        Path(__file__).resolve().parent.parent.parent
+        / "data" / "storage" / "ff_risk_factors.parquet"
+    )
+    series = pd.read_parquet(path)[factor].dropna()
+    return round(float(series.std(ddof=1) * np.sqrt(12)), 4)
 
 
 def hc_type_for_stability(income_stability: str) -> str:
@@ -83,6 +122,21 @@ def sigma_for_stability(income_stability: str) -> float:
     return INCOME_VOLATILITY_SIGMA[income_stability]
 
 
+def hc_type_for_beta(beta: float) -> str:
+    """
+    Human-capital label implied by beta, matching the thresholds enforced by
+    ProfileAgentOutput._check_hc_type_consistent_with_beta (contracts.py).
+
+    Normal construction takes the label from income_stability; this is used when
+    a perturbed beta must carry its label with it (see build_profile overrides).
+    """
+    if beta <= 0.3:
+        return "bond-like"
+    if beta <= 0.8:
+        return "mixed"
+    return "equity-like"
+
+
 def lookup_hc_beta(hc_type: str) -> dict[str, float]:
     if hc_type not in HC_BETA_TABLE:
         raise KeyError(f"Unknown human_capital_type '{hc_type}'. Expected one of {list(HC_BETA_TABLE)}.")
@@ -93,11 +147,14 @@ def implied_market_volatility(
     sigma: float, beta: float, correlation: float
 ) -> float | None:
     """
-    σ_market implied by the single-factor identity β = ρ × σ_income / σ_market.
+    σ_market implied by inverting the single-factor identity β = ρ × σ_income / β.
 
-    Diagnostic only — no downstream calculation consumes it. Because σ, β and ρ
-    are calibrated separately (see the note above HC_BETA_TABLE), this returns a
-    different value per HC type rather than one common market volatility.
+    INTERNAL CONSISTENCY CHECK — no downstream agent consumes this. Since β is
+    now derived from ρ, σ_income and SIGMA_MARKET, inverting the identity must
+    return SIGMA_MARKET for every HC type (± rounding). A value that disagrees
+    means the table has been hand-edited back out of consistency, which is
+    exactly the drift the 24 Jul review flagged.
+
     Returns None when β ≤ 0, where the identity is undefined.
     """
     if beta <= 0:
@@ -133,11 +190,35 @@ def compute_human_capital(
     )
 
 
-def build_profile(persona: dict, discount_rate: float) -> dict:
+def build_profile(
+    persona: dict,
+    discount_rate: float,
+    overrides: dict[str, float] | None = None,
+) -> dict:
     """
     Derive all computed fields from a raw BLS persona dict.
     Returns a flat dict ready for Pydantic validation via to_profile_agent_output().
+
+    Parameters
+    ----------
+    overrides : dict[str, float] | None
+        Optional continuous overrides for the table-driven inputs, keyed
+        "income_volatility_sigma", "income_equity_correlation" and/or
+        "income_equity_beta". Normal profile construction never passes this.
+
+        It exists so agents/profile/sensitivity.py can perturb an input by a
+        few percent and re-derive everything downstream through the real
+        formulas rather than a reimplementation of them. The table lookups are
+        categorical (High/Medium/Low), so without this hook the smallest
+        possible perturbation of sigma is a whole tier — far too coarse to
+        measure how input error propagates into portfolio weights.
+
+        When beta is not overridden it stays derived from the (possibly
+        overridden) sigma and correlation, so the single-factor identity
+        beta = rho * sigma_income / SIGMA_MARKET continues to hold.
     """
+    overrides = overrides or {}
+
     hc = compute_human_capital(
         persona["effective_salary"],
         persona["years_to_retirement"],
@@ -146,11 +227,26 @@ def build_profile(persona: dict, discount_rate: float) -> dict:
     fc = persona["financial_capital"]
     total_wealth = round(fc + hc, 2)
 
-    sigma   = sigma_for_stability(persona["income_stability"])
     hc_type = hc_type_for_stability(persona["income_stability"])
     cal     = lookup_hc_beta(hc_type)
-    beta    = cal["beta"]
-    correlation = cal["correlation"]
+
+    sigma       = overrides.get("income_volatility_sigma",
+                                sigma_for_stability(persona["income_stability"]))
+    correlation = overrides.get("income_equity_correlation", cal["correlation"])
+
+    if "income_equity_beta" in overrides:
+        beta = overrides["income_equity_beta"]
+    elif overrides:
+        # Re-derive so the identity holds for the perturbed inputs too.
+        beta = round(correlation * sigma / SIGMA_MARKET, 4)
+    else:
+        beta = cal["beta"]
+
+    if overrides:
+        # ProfileAgentOutput validates human_capital_type against beta's
+        # thresholds, so a perturbation large enough to cross a tier boundary
+        # must move the label with it or the profile fails validation.
+        hc_type = hc_type_for_beta(beta)
 
     hc_share                = hc / total_wealth
     implicit_equity_exposure = round(hc_share * beta, 3)
