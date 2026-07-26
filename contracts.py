@@ -179,8 +179,14 @@ class ExtractedField(BaseModel):
     """
 
     name:  str
-    value: Optional[float | str | bool] = Field(
-        default=None, description="None whenever source is UNKNOWN"
+    value: Optional[float | str | bool | dict[str, float]] = Field(
+        default=None,
+        description=(
+            "None whenever source is UNKNOWN. The dict form carries a holdings "
+            "breakdown (ticker → fraction) — a client who reads positions off a "
+            "statement is asserting a structure, not a scalar, and flattening it "
+            "would discard the concentration the pipeline exists to find."
+        ),
     )
     source:     FactSource
     confidence: float = Field(
@@ -230,6 +236,98 @@ class ExtractedField(BaseModel):
         return self
 
 
+class StatementKind(str, Enum):
+    """
+    What kind of object a thing the client said actually is.
+
+    A discovery call does not yield one flat list of fields. It yields
+    statements of different kinds, and the system has to sort them before it can
+    act — a preference and a constraint look alike in prose and behave nothing
+    alike in an optimiser.
+    """
+
+    HARD_CONSTRAINT  = "hard_constraint"
+    """Something the client will not hold. Shrinks the feasible set, at a cost that can be measured and reported."""
+
+    SOFT_PREFERENCE  = "soft_preference"
+    """A tilt the client would like reflected. Not a constraint — closer to a Black-Litterman view, and needs a bounded budget before it can be honoured."""
+
+    RISK_FACT        = "risk_fact"
+    """
+    A fact that arrives dressed as a preference but is really an exposure.
+
+    Priya's ARVX holding is not a preference for her employer's stock; it is a
+    concentration, a human-capital beta, and a forced sector underweight — one
+    passage, three destinations. This is the category that makes sorting worth
+    doing at all.
+    """
+
+    SUITABILITY_FACT = "suitability_fact"
+    """Horizon, liquidity, account type, and what is in or out of scope. Often stated once and never repeated."""
+
+    CHALLENGE        = "challenge"
+    """
+    A contradiction worth putting back to the client — a stated risk tolerance
+    that disagrees with their actual exposure, or a self-description that
+    disagrees with their holdings. Recorded for advisor review; never acted on
+    automatically.
+    """
+
+
+class PipelineDestination(str, Enum):
+    """Where a classified statement is supposed to end up."""
+
+    UNIVERSE_EXCLUSION  = "universe_exclusion"
+    CONCENTRATION_LIMIT = "concentration_limit"
+    HUMAN_CAPITAL_BETA  = "human_capital_beta"
+    SECTOR_UNDERWEIGHT  = "sector_underweight"
+    BL_VIEW             = "bl_view"
+    SUITABILITY_RECORD  = "suitability_record"
+    SCOPE_BOUNDARY      = "scope_boundary"
+    ADVISOR_REVIEW      = "advisor_review"
+
+
+class ClientStatement(BaseModel):
+    """
+    One classified thing the client said, with its provenance and destinations.
+
+    Distinct from ExtractedField: a field is a typed value the formulas consume,
+    a statement is a piece of the conversation that has to be routed. The same
+    sentence can produce both — Priya's ARVX line yields an `RSU_concentration`
+    field *and* a RISK_FACT statement bound for three destinations.
+    """
+
+    kind:    StatementKind
+    summary: str = Field(description="One line, in the system's words, of what this statement commits the client to")
+    quote:   str = Field(description="Verbatim span from the transcript. Required — a routed statement must be showable to the client.")
+    evidence_line: Optional[int] = Field(default=None, ge=0)
+
+    destinations: list[PipelineDestination] = Field(
+        default_factory=list,
+        description="Every place this statement must reach. A RISK_FACT commonly has more than one.",
+    )
+    subject: Optional[str] = Field(
+        default=None,
+        description="Ticker, sector, or asset the statement concerns, when it names one",
+    )
+    source:     FactSource = FactSource.STATED
+    confidence: float      = Field(ge=0, le=1, default=0.5)
+
+    @model_validator(mode="after")
+    def _check_routable(self) -> "ClientStatement":
+        if not self.quote.strip():
+            raise ValueError(
+                f"{self.kind.value} statement carries no quote; a statement that "
+                "routes into the pipeline must be showable to the client"
+            )
+        if self.kind != StatementKind.CHALLENGE and not self.destinations:
+            raise ValueError(
+                f"{self.kind.value} statement has no destination — classifying it "
+                "and then routing it nowhere is the failure this taxonomy exists to prevent"
+            )
+        return self
+
+
 class ExtractedProfile(BaseModel):
     """
     The typed output of the intake layer — the 'extract' half of the standing
@@ -244,6 +342,22 @@ class ExtractedProfile(BaseModel):
     transcript_id:  str = Field(description="Identifies the source conversation")
     extractor:      str = Field(description="Which extraction strategy produced this")
     fields:         dict[str, ExtractedField]
+
+    statements: list[ClientStatement] = Field(
+        default_factory=list,
+        description=(
+            "Classified statements from the conversation. Empty for extractors "
+            "that only recover typed fields — classification is a distinct "
+            "capability from extraction and is reported separately."
+        ),
+    )
+
+    def statements_of(self, kind: StatementKind) -> list[ClientStatement]:
+        return [s for s in self.statements if s.kind == kind]
+
+    def statements_for(self, destination: PipelineDestination) -> list[ClientStatement]:
+        """Every statement that must reach a given part of the pipeline."""
+        return [s for s in self.statements if destination in s.destinations]
 
     @property
     def unresolved(self) -> list[str]:
@@ -613,13 +727,27 @@ class MacroRegimeSnapshot(BaseModel):
     regime_confidence: float = Field(ge=0, le=1, description="XGBoost max class probability")
     regime_volatility: float = Field(ge=0, description="6-month rolling std of credit spread — macro stress level")
 
-    # ── Raw FRED signals (all from the 6-feature signal matrix) ───────
-    yield_curve:   float = Field(description="10Y minus 2Y Treasury spread, pct points (T10Y2Y)")
-    term_spread:   float = Field(description="10Y minus 3M Treasury spread, pct points (T10Y3M)")
-    fed_funds:     float = Field(description="Effective Federal Funds Rate, pct (FEDFUNDS)")
-    unemployment:  float = Field(ge=0, description="Civilian Unemployment Rate, pct (UNRATE)")
-    cpi:           float = Field(description="CPI YoY % change, derived from CPIAUCSL")
-    credit_spread: float = Field(ge=0, description="Baa minus 10Y Treasury, pct points (BAA10Y)")
+    # ── Raw FRED signals — DEPRECATED, pending removal ────────────────
+    # The 24 Jul minutes ask this contract to "expose only the fields needed for
+    # allocation (label, confidence, volatility)". These six are consumed by
+    # NOTHING outside the Research Agent — verified by grep across agents/risk,
+    # agents/allocation, agents/compliance and agents/orchestrator — so they are
+    # dead weight on a public contract and a schema-drift risk.
+    #
+    # They are deprecated rather than deleted because tests/test_research.py and
+    # tests/test_compliance.py construct snapshots with them (5-6 references
+    # each), and tests/ is outside the Profile/Research edit scope. Removal is a
+    # one-line change per field once those fixtures can be updated; until then,
+    # use for_allocation() to get the intended minimal view.
+    #
+    # The full signal matrix remains available in RegimeRecord and in
+    # data/outputs/fred_macro_regimes.csv, so nothing is lost by dropping them.
+    yield_curve:   float = Field(description="DEPRECATED — 10Y minus 2Y Treasury spread, pct points (T10Y2Y)")
+    term_spread:   float = Field(description="DEPRECATED — 10Y minus 3M Treasury spread, pct points (T10Y3M)")
+    fed_funds:     float = Field(description="DEPRECATED — Effective Federal Funds Rate, pct (FEDFUNDS)")
+    unemployment:  float = Field(ge=0, description="DEPRECATED — Civilian Unemployment Rate, pct (UNRATE)")
+    cpi:           float = Field(description="DEPRECATED — CPI YoY % change, derived from CPIAUCSL")
+    credit_spread: float = Field(ge=0, description="DEPRECATED — Baa minus 10Y Treasury, pct points (BAA10Y)")
 
     # ── Derived flags (set automatically by validator) ────────────────
     is_low_confidence:      bool = Field(default=False, description="True when regime_confidence < 0.60")
@@ -636,6 +764,20 @@ class MacroRegimeSnapshot(BaseModel):
             "the snapshot is built without the regime sequence and PELT breaks in hand."
         ),
     )
+
+    def for_allocation(self) -> dict:
+        """
+        The minimal view the 24 Jul minutes asked for: label, confidence, volatility.
+
+        Consume this rather than the whole snapshot. It is the intended public
+        surface once the deprecated raw signals above are removed, so code
+        written against it will not need changing when they go.
+        """
+        return {
+            "regime_label":      self.regime_label,
+            "regime_confidence": self.regime_confidence,
+            "regime_volatility": self.regime_volatility,
+        }
 
     @model_validator(mode="after")
     def _set_derived_flags(self) -> "MacroRegimeSnapshot":

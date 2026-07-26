@@ -604,6 +604,24 @@ Each tilt is reported next to the standard error of the mean it rests on, and fl
 
 **Scope:** this module produces the mapping only. Consuming it in the optimiser is review §4.2 and lives in `agents/allocation`. `regime_sleeve_tilts()` returns a plain `{regime: {sleeve: tilt}}` dict, also persisted to `data/outputs/regime_sleeve_tilts.json`.
 
+---
+
+## Snapshot Surface — Deprecation (24 Jul Research action)
+
+The 24 Jul minutes ask this contract to **"expose only the fields needed for allocation (label, confidence, volatility)."** It currently exposes 15.
+
+Verified by grep across `agents/risk`, `agents/allocation`, `agents/compliance` and `agents/orchestrator`: `yield_curve`, `term_spread`, `fed_funds`, `unemployment`, `cpi` and `credit_spread` are consumed in **zero** places outside this agent. The action item is correct — they are dead weight on a public contract and a schema-drift risk. (The "Downstream Agent Field Routing" section above claims Risk and Compliance read some of them. That table is aspirational; the code does not.)
+
+**They are deprecated, not removed.** `tests/test_research.py` and `tests/test_compliance.py` construct snapshots with all six (5–6 references each), and `tests/` is outside the Profile/Research edit scope. Deleting them would break the suite with no way to fix it.
+
+Use **`snapshot.for_allocation()`** instead — it returns the intended minimal view:
+
+```python
+{"regime_label": ..., "regime_confidence": ..., "regime_volatility": ...}
+```
+
+Code written against `for_allocation()` will not need changing when the deprecated fields are finally deleted, which is a one-line-per-field edit once the test fixtures can be updated. Nothing is lost by dropping them: the full signal matrix remains in `RegimeRecord` and in `data/outputs/fred_macro_regimes.csv`.
+
 ### Consumption
 
 `MacroRegimeSnapshot.regime_change_evidence` carries the persona-independent block and flows into `ComplianceInput` and `AdvisorPackage` automatically. The persona-conditioned verdict comes from `evaluate_rebalance(snapshot, profile, regime_stats)` and is the natural source for `RegimeChangeFlag.rebalance_proposed`, which the contract has always declared and no agent has ever populated.

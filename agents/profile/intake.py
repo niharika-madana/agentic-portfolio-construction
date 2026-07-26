@@ -38,7 +38,14 @@ import os
 import re
 from typing import Protocol
 
-from contracts import ExtractedField, ExtractedProfile, FactSource
+from contracts import (
+    ClientStatement,
+    ExtractedField,
+    ExtractedProfile,
+    FactSource,
+    PipelineDestination,
+    StatementKind,
+)
 
 # Fields the intake layer is responsible for recovering.
 TARGET_FIELDS = (
@@ -54,6 +61,9 @@ TARGET_FIELDS = (
     "liquidity_needs",
     "investment_objective",
     "advisor_supplied_beta",
+    "risk_tolerance",
+    "current_holdings",
+    "income_volatility_estimate",
 )
 
 FIELD_VALUE_SPACE = {
@@ -61,6 +71,7 @@ FIELD_VALUE_SPACE = {
     "has_pension":              [True, False],
     "liquidity_needs":          ["low", "medium", "high"],
     "investment_objective":     ["growth", "income", "preservation"],
+    "risk_tolerance":           ["conservative", "moderate", "aggressive"],
 }
 """
 Allowed values for the categorical fields.
@@ -74,6 +85,39 @@ not merely awkward to grade.
 """
 
 
+FIELD_UNITS = {
+    "annual_salary":            "base salary in dollars, a number (310000, not '$310k')",
+    "bonus_rate":               "FRACTION of base salary, not dollars — 25% is 0.25",
+    "financial_capital":        "total investable assets in dollars; sum the holdings if the client lists them separately, and mark it inferred because the sum is yours, not theirs",
+    "RSU_concentration":        "FRACTION of total financial holdings held in employer stock, between 0 and 1 — $360,000 of employer stock inside $905,000 of holdings is 0.40, NOT 360000",
+    "investment_horizon_years": "whole years until the money is drawn on; if the client gives a retirement age, subtract their current age and mark it inferred",
+    "age":                      "whole years",
+    "income_volatility_estimate": (
+        "annualised standard deviation of TOTAL compensation as a FRACTION of "
+        "average total comp, between 0 and 1. Estimate it from what the client "
+        "describes, not from a table: a base that never moves is near 0.05; a "
+        "base plus a bonus that swings from zero to well above target is 0.30-0.45. "
+        "Return null unless the client actually describes year-to-year variation — "
+        "this is the single most consequential input in the model and a guess is "
+        "worse than an honest unknown."
+    ),
+    "current_holdings":         (
+        "a JSON object mapping asset name or ticker to its FRACTION of total "
+        'holdings, summing to 1.0 — e.g. {"ARVX": 0.40, "VTI": 0.28, "cash": 0.10}. '
+        "Use the client's own tickers where given; do not invent positions."
+    ),
+}
+"""
+Units and shape for the numeric fields.
+
+`RSU_concentration` is the one that bites: it reads as a quantity and the
+transcript states it as a dollar figure, so an extractor with no unit guidance
+returns 360000 for a field the contract bounds to [0, 1]. The profile then fails
+validation at the bridge, one layer away from the actual mistake. Stating the
+unit in the prompt is cheaper than catching it downstream.
+"""
+
+
 def _value_space_spec() -> str:
     """Render the allowed-values constraint for inclusion in a prompt."""
     lines = [
@@ -81,6 +125,11 @@ def _value_space_spec() -> str:
         for name, values in FIELD_VALUE_SPACE.items()
     ]
     return "\n".join(lines)
+
+
+def _units_spec() -> str:
+    """Render the units constraint for inclusion in a prompt."""
+    return "\n".join(f"  {name}: {desc}" for name, desc in FIELD_UNITS.items())
 
 
 FOLLOW_UP_QUESTIONS = {
@@ -96,6 +145,9 @@ FOLLOW_UP_QUESTIONS = {
     "liquidity_needs":          "Do you anticipate needing cash from this in the next few years?",
     "investment_objective":     "Is the priority growth, income, or protecting what's there?",
     "advisor_supplied_beta":    "How sensitive do you think your income is to the stock market?",
+    "risk_tolerance":           "How would you describe your appetite for risk?",
+    "current_holdings":         "What are you holding today, and roughly how much in each?",
+    "income_volatility_estimate": "In a bad year versus a good year, how much does your total pay actually differ?",
 }
 
 
@@ -201,6 +253,53 @@ def _unknown(name: str) -> ExtractedField:
     )
 
 
+def _is_turn_formatted(lines: list[str]) -> bool:
+    """True when the transcript uses explicit SPEAKER: turns."""
+    return any(l.startswith(("CLIENT:", "ADVISOR:")) for l in lines)
+
+
+def _client_voice(lines: list[str]) -> str:
+    """
+    The text attributable to the client.
+
+    Turn-formatted transcripts give this exactly. Real intake notes often do
+    not: the reference discovery call is the advisor's own prose written after
+    the fact, with the client's statements reported rather than quoted. In that
+    format there is no line-level attribution to be had, so the whole document
+    is searched and attribution has to be decided per fact instead of per line —
+    which is why `_advisor_voice` narrows to the sentences that mark an
+    advisor-originated judgement.
+
+    Reading only `CLIENT:` lines silently returned nothing on the reference
+    transcript: 0 of 12 fields, no error.
+    """
+    if _is_turn_formatted(lines):
+        return "\n".join(l for l in lines if l.startswith("CLIENT:"))
+    return "\n".join(lines)
+
+
+_ADVISOR_JUDGEMENT_CUES = (
+    "i'd call", "i would call", "i'd put", "i would put", "i said",
+    "when i floated", "i floated", "think of it like", "i'd say",
+)
+
+
+def _advisor_voice(lines: list[str]) -> str:
+    """
+    Text carrying an advisor-originated judgement rather than a client assertion.
+
+    In turn format that is the ADVISOR lines. In prose notes it is the sentences
+    where the advisor marks their own opinion — "I'd put her at a moderate risk
+    tolerance", "when I floated that ... a beta of about 1.2". Those numbers
+    must not be recorded as the client's own, however readily the client agreed.
+    """
+    if _is_turn_formatted(lines):
+        return "\n".join(l for l in lines if l.startswith("ADVISOR:"))
+    return "\n".join(
+        l for l in lines if any(cue in l.lower() for cue in _ADVISOR_JUDGEMENT_CUES)
+    )
+
+
 def _find_line(lines: list[str], quote: str) -> int | None:
     """Index of the first line containing `quote`, or None."""
     if not quote:
@@ -238,7 +337,7 @@ class RuleBasedExtractor:
 
     def extract(self, transcript: str, client_id: str, transcript_id: str) -> ExtractedProfile:
         lines = transcript.split("\n")
-        client_text = "\n".join(l for l in lines if l.startswith("CLIENT:"))
+        client_text = _client_voice(lines)
         fields: dict[str, ExtractedField] = {}
 
         def stated(name: str, value, quote: str, confidence: float) -> None:
@@ -320,7 +419,7 @@ class RuleBasedExtractor:
         # advisor proposed the number and the client only assented to it. A
         # suitability file that records this as the client's own assertion has
         # lost the distinction that matters most.
-        advisor_text = "\n".join(l for l in lines if l.startswith("ADVISOR:"))
+        advisor_text = _advisor_voice(lines)
         m = re.search(r"sensitivity somewhere around (\d+(?:\.\d+)?)", advisor_text)
         if m:
             fields["advisor_supplied_beta"] = ExtractedField(
@@ -351,6 +450,9 @@ _NAIVE_PROMPT = """Read this client discovery call and return a JSON object with
 Constrained fields — use exactly these values:
 {value_space}
 
+Units — return numbers in these units:
+{units}
+
 Return ONLY the JSON object, values only, no explanation.
 
 TRANSCRIPT:
@@ -378,6 +480,7 @@ class NaiveExtractor:
             _NAIVE_PROMPT.format(
                 fields=", ".join(TARGET_FIELDS),
                 value_space=_value_space_spec(),
+                units=_units_spec(),
                 transcript=transcript,
             ),
             model=self.model,
@@ -434,6 +537,10 @@ description. A paraphrase like "stable base but variable bonus" is unusable
 downstream even when it is accurate:
 {value_space}
 
+Units — return numbers in these units. Getting these wrong fails validation
+one layer downstream, where the cause is no longer visible:
+{units}
+
 Return ONLY a JSON object mapping each field name to its object.
 
 TRANSCRIPT:
@@ -441,26 +548,134 @@ TRANSCRIPT:
 """
 
 
+_CLASSIFY_PROMPT = """You are sorting a client discovery call for a fiduciary advisory system.
+
+Typed field extraction is handled separately. Your job is different: identify the
+statements in this conversation that must be ROUTED somewhere, and say where.
+
+Return a JSON object with one key, "statements", holding a list. Each entry:
+
+  "kind"         one of:
+                   hard_constraint   — something the client will not hold
+                   soft_preference   — a tilt they'd like reflected (not binding)
+                   risk_fact         — arrives sounding like a preference but is
+                                       really an exposure (a concentration, an
+                                       income beta, a forced sector underweight)
+                   suitability_fact  — horizon, liquidity, account type, and what
+                                       is in or out of scope
+                   challenge         — a contradiction worth putting back to the
+                                       client (stated risk tolerance disagreeing
+                                       with actual exposure, self-description
+                                       disagreeing with holdings)
+  "summary"      one line, in your words, of what this commits the client to
+  "quote"        VERBATIM span from the transcript. Copy exactly. Required.
+  "subject"      ticker / sector / asset it concerns, or null
+  "destinations" list of: universe_exclusion, concentration_limit,
+                 human_capital_beta, sector_underweight, bl_view,
+                 suitability_record, scope_boundary, advisor_review
+  "source"       "stated" if the client asserted it; "inferred" if the advisor
+                 supplied it and the client agreed
+  "confidence"   0.0 to 1.0
+
+Telling risk_fact from challenge — the pair most easily confused:
+- A risk_fact states an EXPOSURE. "40% of my account is my employer's stock."
+- A challenge states a CONTRADICTION between two things the client has told you.
+  "I'm cautious" alongside "I want this to double in ten years" is a challenge:
+  neither half is an exposure, but together they cannot both be satisfied.
+- If one passage does both — asserts an exposure AND contradicts something the
+  client said earlier — emit TWO statements over the same quote, one of each
+  kind. Do not pick whichever seems dominant.
+
+Rules that matter:
+- A risk_fact usually has MORE THAN ONE destination. A holding in the client's
+  own employer is simultaneously a concentration, a human-capital beta, and a
+  reason to underweight that sector. Give every destination that applies.
+- Every entry except a challenge must have at least one destination. If you
+  cannot say where a statement goes, it is not a statement worth classifying.
+- Do not invent statements. Only classify what is actually in the text.
+- A challenge is recorded for a human to review, never acted on automatically.
+
+Return ONLY the JSON object.
+
+TRANSCRIPT:
+{transcript}
+"""
+
+
+def _parse_statements(raw: str, lines: list[str]) -> list[ClientStatement]:
+    """Parse and validate a classification response, dropping unroutable entries."""
+    parsed = _parse_json_block(raw)
+    out: list[ClientStatement] = []
+
+    for entry in parsed.get("statements", []):
+        if not isinstance(entry, dict):
+            continue
+        quote = (entry.get("quote") or "").strip()
+        if not quote:
+            continue  # unshowable to the client, so not routable
+
+        try:
+            destinations = [
+                PipelineDestination(d)
+                for d in entry.get("destinations", [])
+                if d in PipelineDestination._value2member_map_
+            ]
+            out.append(ClientStatement(
+                kind          = StatementKind(entry["kind"]),
+                summary       = entry.get("summary", "").strip() or quote[:80],
+                quote         = quote,
+                evidence_line = _find_line(lines, quote),
+                destinations  = destinations,
+                subject       = entry.get("subject"),
+                source        = FactSource(str(entry.get("source", "stated")).lower()),
+                confidence    = float(entry.get("confidence", 0.5)),
+            ))
+        except (KeyError, ValueError):
+            # A malformed or unroutable classification is dropped rather than
+            # coerced — the contract's validators define what routable means.
+            continue
+
+    return out
+
+
 class StructuredExtractor:
     """
-    Field-by-field extraction with an explicit unknown option and provenance.
+    Field-by-field extraction with an explicit unknown option and provenance,
+    plus statement classification.
 
     The design claim being tested: giving the model somewhere honest to put "I
     don't know", and requiring it to cite the sentence, produces a profile a
     fiduciary system can actually defend. The harness decides whether that claim
     survives contact with the answer key.
+
+    Classification is a second call. It is kept separate from field extraction
+    because they are different jobs against different targets — one recovers
+    typed values the formulas consume, the other sorts prose into things that
+    must be routed. Merging them into one prompt made both worse in testing.
     """
 
     name = "structured"
 
-    def __init__(self, model: str = DEFAULT_MODEL):
+    def __init__(self, model: str = DEFAULT_MODEL, classify: bool = True):
         self.model = model
+        self.classify = classify
+
+    def _classify(self, transcript: str) -> list[ClientStatement]:
+        try:
+            raw = call_model(
+                _CLASSIFY_PROMPT.format(transcript=transcript), model=self.model
+            )
+            return _parse_statements(raw, transcript.split("\n"))
+        except Exception as e:
+            print(f"  classification failed: {type(e).__name__}: {str(e)[:80]}")
+            return []
 
     def extract(self, transcript: str, client_id: str, transcript_id: str) -> ExtractedProfile:
         raw = call_model(
             _STRUCTURED_PROMPT.format(
                 fields=", ".join(TARGET_FIELDS),
                 value_space=_value_space_spec(),
+                units=_units_spec(),
                 transcript=transcript,
             ),
             model=self.model,
@@ -501,6 +716,7 @@ class StructuredExtractor:
         return ExtractedProfile(
             client_id=client_id, transcript_id=transcript_id,
             extractor=self.name, fields=fields,
+            statements=self._classify(transcript) if self.classify else [],
         )
 
 

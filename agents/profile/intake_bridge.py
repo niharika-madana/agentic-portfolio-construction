@@ -52,8 +52,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field as dc_field
 
-from contracts import ExtractedProfile, FactSource, ProfileAgentOutput
+from contracts import (
+    ClientStatement,
+    ExtractedProfile,
+    FactSource,
+    PipelineDestination,
+    ProfileAgentOutput,
+)
 from agents.profile.profile_model import (
+    sigma_for_stability,
     HC_BETA_TABLE,
     build_profile,
     hc_type_for_stability,
@@ -97,6 +104,49 @@ would pull this from statements, not assume it.
 """
 
 
+CONCENTRATION_THRESHOLD = 0.10
+"""
+Single-name weight above which a holding is flagged as a concentration.
+
+Matches the 10% single-name cap the Allocation Agent already enforces
+(SINGLE_NAME_LIMIT), so a position flagged here is one the optimiser would have
+to cut anyway. Flagging is not enforcement — the Profile Agent reports, the
+optimiser acts.
+"""
+
+
+@dataclass
+class RoutedStatements:
+    """
+    Classified statements sorted by what the Profile Agent can do with them.
+
+    The taxonomy assigns each statement a destination. Without this, that
+    assignment is decoration: the statements are classified, carried, and then
+    nothing reads them — the exact "a stage computes something correct and the
+    next stage never receives it" failure the July 24 review leads with.
+
+    Three of these the Profile Agent acts on itself (concentrations are measured
+    against the client's actual holdings; exclusions and scope boundaries are
+    recorded on the profile's audit trail). The rest are carried as structured
+    output for the agents that own those decisions — `soft_views` is Black-
+    Litterman input and belongs to Allocation, `for_advisor_review` belongs to a
+    human.
+    """
+
+    concentrations:    list[str] = dc_field(default_factory=list)
+    sector_underweights: list[str] = dc_field(default_factory=list)
+    exclusions:        list[str] = dc_field(default_factory=list)
+    out_of_scope:      list[str] = dc_field(default_factory=list)
+    soft_views:        list[ClientStatement] = dc_field(default_factory=list)
+    for_advisor_review: list[str] = dc_field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not any([
+            self.concentrations, self.sector_underweights, self.exclusions,
+            self.out_of_scope, self.soft_views, self.for_advisor_review,
+        ])
+
+
 @dataclass
 class BridgeResult:
     """
@@ -112,6 +162,8 @@ class BridgeResult:
     defaulted_fields: list[str] = dc_field(default_factory=list)
     open_questions:  list[str] = dc_field(default_factory=list)
     conflicts:       list[str] = dc_field(default_factory=list)
+    statements:      list[ClientStatement] = dc_field(default_factory=list)
+    routed:          RoutedStatements = dc_field(default_factory=RoutedStatements)
 
     @property
     def built(self) -> bool:
@@ -123,10 +175,142 @@ class BridgeResult:
                 f"{self.client_id}: NOT BUILT — {len(self.open_questions)} required "
                 f"field(s) never discussed."
             )
+        routed = "" if self.routed.is_empty() else (
+            f", {len(self.statements)} statement(s) routed"
+        )
         return (
             f"{self.client_id}: built from {len(self.stated_fields)} stated fact(s), "
             f"{len(self.defaulted_fields)} defaulted, {len(self.conflicts)} conflict(s)"
+            f"{routed}"
         )
+
+
+def route_statements(
+    statements: list[ClientStatement],
+    holdings: dict[str, float] | None,
+) -> RoutedStatements:
+    """
+    Sort classified statements into what the Profile Agent can act on.
+
+    `concentration_limit` statements are checked against the client's actual
+    holdings rather than taken at face value. A client saying "that's a lot in
+    one name" is a claim; the weight in their book is the evidence. When both
+    agree the flag carries a measured number, which is what a suitability file
+    needs — and when the holdings do not support the claim, that disagreement is
+    worth seeing too.
+    """
+    routed = RoutedStatements()
+    holdings = holdings or {}
+
+    # Several statements commonly name the same position — Priya's ARVX is
+    # raised as an employer tie, a concentration and a sector exposure in three
+    # separate sentences. Deduplicate on the resolved holding rather than on the
+    # classifier's subject string, which varies ("ARVX", "ARVX / biotech
+    # sector"), so one position produces one flag.
+    seen_positions: set[str] = set()
+
+    for s in statements:
+        subject = (s.subject or "").strip()
+
+        if PipelineDestination.CONCENTRATION_LIMIT in s.destinations:
+            ticker, weight = _resolve_holding(holdings, subject)
+            key = ticker or subject.lower()
+            if key not in seen_positions:
+                seen_positions.add(key)
+                if weight is None:
+                    routed.concentrations.append(
+                        f"{subject or 'unnamed position'}: raised in conversation, "
+                        f"not identifiable in current holdings — confirm with client"
+                    )
+                elif weight >= CONCENTRATION_THRESHOLD:
+                    routed.concentrations.append(
+                        f"{ticker}: {weight:.1%} of holdings, above the "
+                        f"{CONCENTRATION_THRESHOLD:.0%} single-name limit"
+                    )
+                else:
+                    routed.concentrations.append(
+                        f"{ticker}: {weight:.1%} of holdings — below the "
+                        f"{CONCENTRATION_THRESHOLD:.0%} limit despite being raised as a concern"
+                    )
+
+        if PipelineDestination.SECTOR_UNDERWEIGHT in s.destinations and subject:
+            # Prefer a holdings ticker when the subject resolves to one, so
+            # "ARVX" and "ARVX / biotech sector" collapse to a single entry.
+            ticker, _ = _resolve_holding(holdings, subject)
+            entry = ticker or subject
+            if entry not in routed.sector_underweights:
+                routed.sector_underweights.append(entry)
+
+        if PipelineDestination.UNIVERSE_EXCLUSION in s.destinations:
+            routed.exclusions.append(f"{subject or s.summary}: {s.summary}")
+
+        if PipelineDestination.SCOPE_BOUNDARY in s.destinations:
+            routed.out_of_scope.append(s.summary)
+
+        if PipelineDestination.BL_VIEW in s.destinations:
+            routed.soft_views.append(s)
+
+        if PipelineDestination.ADVISOR_REVIEW in s.destinations:
+            routed.for_advisor_review.append(s.summary)
+
+    return routed
+
+
+def _resolve_holding(
+    holdings: dict[str, float], subject: str
+) -> tuple[str | None, float | None]:
+    """
+    Resolve a statement's subject to a holding, returning (ticker, weight).
+
+    The subject is written by a classifier and arrives in several shapes for the
+    same position — "ARVX", "ARVX / biotech sector", "her own company stock". An
+    exact key lookup catches only the first, so match on whether a holdings key
+    appears in the subject or vice versa, and return the canonical ticker so
+    callers can deduplicate on it.
+
+    Returns (None, None) when nothing matches — which is itself informative: a
+    concentration raised in conversation that does not appear in the book is a
+    discrepancy worth surfacing, not a silent no-op.
+    """
+    if not subject or not holdings:
+        return None, None
+    needle = subject.upper()
+    for ticker, weight in holdings.items():
+        t = ticker.upper()
+        if t == needle or t in needle or needle in t:
+            return ticker, float(weight)
+    return None, None
+
+
+def _normalise_holdings(value) -> dict[str, float] | None:
+    """
+    Coerce an extracted holdings breakdown into weights summing to 1.0.
+
+    Returns None when nothing usable was extracted, so the caller falls back to
+    the neutral book and reports it as defaulted.
+
+    Normalising rather than rejecting an imperfect sum is deliberate: a client
+    reading balances off a statement produces figures that sum to 0.98 or 1.03,
+    and discarding a real holdings breakdown over rounding would throw away the
+    concentration this pipeline exists to find. Anything that is not a positive
+    number is dropped; if nothing survives, the caller defaults.
+    """
+    if not isinstance(value, dict) or not value:
+        return None
+
+    clean: dict[str, float] = {}
+    for ticker, weight in value.items():
+        try:
+            w = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if w > 0:
+            clean[str(ticker)] = w
+
+    total = sum(clean.values())
+    if not clean or total <= 0:
+        return None
+    return {t: round(w / total, 6) for t, w in clean.items()}
 
 
 def _resolve(extracted: ExtractedProfile, name: str):
@@ -235,8 +419,16 @@ def to_persona(extracted: ExtractedProfile) -> tuple[dict | None, BridgeResult]:
             result.stated_fields.append("investment_horizon_years")
 
     persona["career_type"] = persona["industry_exposure_sector"]
-    persona["current_holdings"] = dict(DEFAULT_HOLDINGS)
-    result.defaulted_fields.append("current_holdings")
+
+    holdings, h_src = _resolve(extracted, "current_holdings")
+    normalised = _normalise_holdings(holdings)
+    if normalised is None:
+        persona["current_holdings"] = dict(DEFAULT_HOLDINGS)
+        result.defaulted_fields.append("current_holdings")
+    else:
+        persona["current_holdings"] = normalised
+        if h_src == FactSource.STATED:
+            result.stated_fields.append("current_holdings")
 
     result.conflicts = _check_calibration_conflicts(extracted, persona["income_stability"])
     result.stated_fields.sort()
@@ -254,12 +446,91 @@ def build_profile_from_intake(
     extracted inputs. The extractor supplies facts; the formulas supply figures.
     """
     persona, result = to_persona(extracted)
+
+    # Statements are routed whether or not a profile could be built. A
+    # conversation that is missing a required field still carries exclusions,
+    # scope boundaries and things needing a human — discarding those because a
+    # salary was never mentioned would throw away the part that does not depend
+    # on it.
+    result.statements = list(extracted.statements)
+    result.routed = route_statements(
+        extracted.statements,
+        persona.get("current_holdings") if persona else None,
+    )
+
     if persona is None:
         return result
 
-    profile_dict = build_profile(persona, discount_rate)
+    profile_dict = build_profile(
+        persona, discount_rate, overrides=_sigma_override(extracted, result)
+    )
     result.profile = to_profile_agent_output(profile_dict)
     return result
+
+
+SIGMA_BOUNDS = (0.01, 0.60)
+"""
+Admissible range for a transcript-derived income volatility.
+
+A value outside this is not a measurement, it is a misread — 0 means no income
+risk at all and >0.6 exceeds anything the calibration table contemplates. Out of
+range falls back to the tier.
+"""
+
+
+def _sigma_override(extracted: ExtractedProfile, result: BridgeResult) -> dict | None:
+    """
+    Use a transcript-derived income volatility in place of the tier lookup.
+
+    `income_stability` maps to three values — 0.05, 0.20, 0.40. That is a coarse
+    instrument for the quantity the sensitivity analysis identifies as the most
+    consequential input in the whole pipeline: a ±20% error in sigma moves the
+    mixed persona's equity share 13.5 points, more than any other field.
+
+    A transcript can carry more than three levels. "A target bonus around 25%
+    but all over the place year to year — some years basically zero, other years
+    well above target" describes a distribution, and collapsing it to `Low` and
+    then to 0.40 discards the width the mentor calls "the single most important
+    input to her human-capital valuation".
+
+    So when the client actually describes year-to-year variation, that estimate
+    is used and the substitution is recorded. When they do not, the tier stands —
+    the extractor is instructed to return null rather than guess, because a
+    fabricated sigma is worse than a coarse one.
+    """
+    value, source = _resolve(extracted, "income_volatility_estimate")
+    if value is None:
+        return None
+
+    try:
+        sigma = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    low, high = SIGMA_BOUNDS
+    if not (low <= sigma <= high):
+        result.conflicts.append(
+            f"income_volatility_estimate {sigma:.3f} is outside the admissible "
+            f"range [{low}, {high}] — ignored, tier value used instead."
+        )
+        return None
+
+    tier = sigma_for_stability(
+        {"high": "High", "medium": "Medium", "low": "Low"}.get(
+            str(extracted.value_of("income_stability")).lower(),
+            str(extracted.value_of("income_stability")),
+        )
+    ) if extracted.value_of("income_stability") else None
+
+    if tier is not None and abs(tier - sigma) > 0.02:
+        result.conflicts.append(
+            f"income_volatility_sigma: transcript supports {sigma:.3f} "
+            f"({source.value if source else 'unknown'}); the "
+            f"'{extracted.value_of('income_stability')}' tier would give {tier:.2f}. "
+            f"Transcript estimate used — it is a description of this client's own "
+            f"pay, not a population bucket."
+        )
+    return {"income_volatility_sigma": sigma}
 
 
 def run(save: bool = False) -> list[BridgeResult]:

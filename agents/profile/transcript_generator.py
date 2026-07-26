@@ -71,6 +71,28 @@ class PlantedFact:
 
 
 @dataclass
+class PlantedStatement:
+    """
+    A statement deliberately planted in a transcript, with its expected routing.
+
+    The classification answer key. Same principle as the field answer key: the
+    ground truth is the input that produced the transcript, not something read
+    back out of it afterwards, so a classifier cannot score well by agreeing
+    with whoever wrote the key.
+
+    `required_destinations` is what a correct classification MUST include.
+    Extra destinations are not penalised — a risk fact legitimately reaches
+    several places, and the taxonomy's point is that missing one is the error,
+    not finding one more.
+    """
+
+    kind:    str
+    subject: str | None
+    quote:   str
+    required_destinations: tuple[str, ...]
+
+
+@dataclass
 class TranscriptCase:
     """A synthetic discovery call plus the key that generated it."""
 
@@ -79,6 +101,7 @@ class TranscriptCase:
     text:          str
     lines:         list[str]
     facts:         dict[str, PlantedFact] = dc_field(default_factory=dict)
+    planted_statements: list[PlantedStatement] = dc_field(default_factory=list)
 
     @property
     def omitted(self) -> list[str]:
@@ -306,16 +329,147 @@ def generate_transcript(
         if plan.get(name) == Salience.OMITTED or name not in plan:
             _plant(facts, name, None, Salience.OMITTED, False)
 
+    # ── Statements to classify ─────────────────────────────────────────────
+    # Planted deliberately so classification can be SCORED rather than asserted.
+    # One of each kind that matters, including the two the taxonomy exists for:
+    # a risk fact that must reach several destinations at once, and a challenge
+    # where the client's self-description disagrees with their own position.
+    planted: list[PlantedStatement] = []
+
+    b.advisor("Anything you'd refuse to hold on principle?")
+    excl_quote = "I don't want tobacco or weapons in there. That's firm."
+    b.client(excl_quote)
+    planted.append(PlantedStatement(
+        kind="hard_constraint", subject="tobacco, weapons",
+        quote=excl_quote, required_destinations=("universe_exclusion",),
+    ))
+
+    pref_quote = "I'd like some clean-energy exposure if it doesn't cost me much."
+    b.client(pref_quote)
+    planted.append(PlantedStatement(
+        kind="soft_preference", subject="clean energy",
+        quote=pref_quote, required_destinations=("bl_view",),
+    ))
+
+    if rsu:
+        # The category the whole taxonomy exists for: employer stock is at once
+        # a single-name concentration, an income beta, and a reason to
+        # underweight the sector the client already earns their living in.
+        risk_quote = (
+            f"About {rsu:.0%} of the account is my own company's stock, and my "
+            f"salary comes from the same place."
+        )
+        b.client(risk_quote)
+        planted.append(PlantedStatement(
+            kind="risk_fact", subject=sector,
+            quote=risk_quote,
+            required_destinations=("concentration_limit", "human_capital_beta"),
+        ))
+
+    scope_quote = "The house isn't part of this, and my partner's accounts are separate."
+    b.client(scope_quote)
+    planted.append(PlantedStatement(
+        kind="suitability_fact", subject=None,
+        quote=scope_quote, required_destinations=("scope_boundary",),
+    ))
+
+    b.advisor("How would you describe your appetite for risk?")
+    # A challenge must be a CONTRADICTION, not a restatement of an exposure.
+    # The earlier version of this line ("most of what I own is in the one
+    # stock") asserted a concentration — and did so for all nine personas,
+    # including the six holding no employer stock at all. That is a risk fact
+    # wearing a challenge's label, so a classifier filing it as `risk_fact` was
+    # reading it correctly and the answer key was wrong. It cost 7 of 38 on kind
+    # accuracy and every one of those was the harness's fault.
+    #
+    # This version contradicts the client's own stated tolerance against their
+    # own stated goal, with no exposure claim attached and nothing that depends
+    # on the persona's holdings.
+    # The contradiction must also avoid *satisfying* the refusal tests. An
+    # earlier version read "...I would like this to roughly double over the next
+    # ten years", which hands the extractor an investment horizon and a growth
+    # objective — both planted as OMITTED. Structured hallucination jumped from
+    # 0% to 52.9% and every one of those was the extractor correctly reading a
+    # horizon this generator had put in the transcript.
+    #
+    # So a planted statement has two constraints, not one: it must be the kind
+    # it claims to be, and it must not mention any field planted as OMITTED.
+    chal_quote = (
+        "Pretty cautious, I'd say. Though honestly a 30% drop wouldn't "
+        "bother me all that much."
+    )
+    b.client(chal_quote)
+    planted.append(PlantedStatement(
+        kind="challenge", subject=None,
+        quote=chal_quote, required_destinations=("advisor_review",),
+    ))
+
     b.advisor("That's a good picture to start from. I'll put some numbers together.")
 
     text = "\n".join(b.lines)
-    return TranscriptCase(
+    case = TranscriptCase(
         transcript_id=f"synth_{client_id}_s{seed}",
         client_id=client_id,
         text=text,
         lines=b.lines,
         facts=facts,
+        planted_statements=planted,
     )
+    _assert_omissions_are_omitted(case)
+    return case
+
+
+# Words that would let an extractor legitimately recover a field the answer key
+# says was never discussed. Keyed by the OMITTED field they would satisfy.
+# Phrases, deliberately, not bare words. A first version tripped on "years" and
+# fired on "works out around 5% most years" — a bonus statement with nothing to
+# do with an investment horizon. A guard that cries wolf gets switched off, so
+# each cue has to be specific enough that its presence really would let an
+# extractor recover the omitted field.
+_OMISSION_TRIPWIRES = {
+    "investment_horizon_years": (
+        "over the next", "next ten years", "retire in", "retire at",
+        "stop working", "time horizon", "until about",
+    ),
+    "investment_objective":     (
+        "roughly double", "grow it", "income from this", "preserve capital",
+        "capital preservation",
+    ),
+    "liquidity_needs":          (
+        "need cash", "draw on it", "draw on this", "need the money",
+    ),
+}
+
+
+def _assert_omissions_are_omitted(case: TranscriptCase) -> None:
+    """
+    Fail loudly when a transcript discusses a field its answer key calls OMITTED.
+
+    A field planted as OMITTED is a refusal test: the extractor is supposed to
+    return unknown, and is marked as hallucinating if it returns a value. That
+    only holds if the transcript genuinely never mentions it — otherwise the
+    extractor is reading correctly and the harness scores it as fabricating.
+
+    This is not hypothetical. A planted challenge that read "I would like this
+    to roughly double over the next ten years" pushed structured hallucination
+    from 0% to 52.9% in one run, entirely because the generator had put a
+    horizon and an objective into a transcript that claimed to have neither.
+    A silent 52-point swing in the headline metric is exactly the failure this
+    check exists to make noisy.
+    """
+    lowered = case.text.lower()
+    for field, cues in _OMISSION_TRIPWIRES.items():
+        planted = case.facts.get(field)
+        if planted is None or planted.salience != Salience.OMITTED:
+            continue
+        hits = [c for c in cues if c in lowered]
+        if hits:
+            raise AssertionError(
+                f"{case.transcript_id}: '{field}' is planted as OMITTED — a "
+                f"refusal test — but the transcript contains {hits}. An extractor "
+                f"reading that would be scored as hallucinating. Reword the "
+                f"transcript or stop planting this field as omitted."
+            )
 
 
 def generate_corpus(

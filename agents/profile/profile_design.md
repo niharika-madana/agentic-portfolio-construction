@@ -611,25 +611,39 @@ The 'extract' half of the standing rule (LLMs extract, classify, narrate; determ
 
 | metric | rule_based | naive | **structured** |
 |---|---|---|---|
-| overall accuracy | 90.3% | 74.5% | **98.6%** |
-| recall: prominent | 91.7% | 97.2% | 91.7% |
-| recall: mentioned | 76.3% | 100% | 100% |
+| overall accuracy | 98.6% | 86.1% | **98.6%** |
+| recall: prominent | 91.7% | 91.7% | 91.7% |
+| recall: mentioned | 100% | 100% | 100% |
 | recall: parenthetical | 100% | 100% | 100% |
 | provenance (has quote) | 100% | 0% | 100% |
-| quote verified | 86.2% | 0% | **100%** |
-| stated vs inferred | 100% | 12.2% | 87.8% |
-| refusal recall | 100% | **2.9%** | 100% |
-| hallucination rate | 0% | **97.1%** | **0%** |
-| calibration error | 13.4% | 24.3% | **6.2%** |
+| quote verified | 87.8% | 0% | **100%** |
+| stated vs inferred | 100% | **12.2%** | 90.5% |
+| refusal recall | 100% | 60.3% | 100% |
+| hallucination rate | 0% | **39.7%** | **0%** |
+| calibration error | 16.6% | 32.9% | **6.4%** |
 
-**The design earns its complexity, and the margin is not subtle.** Structured beats the single-call control by 24 points of overall accuracy, and the decisive number is refusal: asked about a field the client never discussed, the naive extractor invents a plausible value **97.1%** of the time. The structured extractor does it **0%** of the time — it returns `unknown` with a follow-up question instead. For a suitability file that difference is the whole ballgame, because a fabricated liquidity need or horizon is indistinguishable from a real one once it reaches the optimiser.
+**On fields that were actually discussed, all three are near-perfect.** The per-field breakdown shows the real story — naive fails on exactly three fields, and they are exactly the ones the transcripts never mention:
+
+| field | naive | rule_based | structured |
+|---|---|---|---|
+| `investment_horizon_years` | 0.722 | 1.000 | 1.000 |
+| `investment_objective` | 0.556 | 1.000 | 1.000 |
+| `liquidity_needs` | 0.556 | 1.000 | 1.000 |
+| `income_stability` | 0.944 | 0.833 | 0.833 |
+| *(the other eight fields)* | 1.000 | 1.000 | 1.000 |
+
+**The entire gap is refusal.** Asked about something never discussed, the single-call control invents a plausible value **39.7%** of the time; the structured extractor does it **0%** of the time, returning `unknown` plus a follow-up question. For a suitability file that is decisive — a fabricated liquidity need is indistinguishable from a real one once it reaches the optimiser.
 
 Two secondary results worth keeping:
 
-- **Naive cannot separate what the client said from what the advisor said** (stated-vs-inferred 12.2%). The transcripts plant an advisor-supplied beta the client merely assents to — the mentor's Priya beta-1.2 point — and the naive extractor records it as the client's own assertion.
-- **Only the structured extractor is calibrated** (6.2% error). Its 0.8–1.0 confidence bucket is 100% accurate against a stated 0.95, so its confidence can actually be used as a routing signal.
+- **Naive cannot separate what the client said from what the advisor said** (stated-vs-inferred 12.2%). The transcripts plant an advisor-supplied beta the client merely assents to — the mentor's Priya beta-1.2 point — and naive records it as the client's own assertion.
+- **Only the structured extractor is calibrated** (6.4% error against naive's 32.9%), so only its confidence can be used as a routing signal.
 
-The rule-based floor is respectable (90.3%) and remains the offline default, but it plateaus where regex does: 76.3% recall on single-mention facts, and 86.2% quote verification because its cue-window slices don't always land on a verbatim span.
+`income_stability` is the one field everybody finds hard, and naive is *best* at it (0.944 vs 0.833) — inferring a category from a qualitative cue is the one place an unconstrained single call has an edge.
+
+**Adding the units spec halved naive's hallucination rate** (97.1% → 39.7%). Telling it that some values are derived rather than stated implicitly taught it when to answer "inferred" instead of inventing. Still 39.7% against 0%.
+
+The rule-based floor now matches structured on overall accuracy (98.6%) but plateaus where regex must: 87.8% on quote verification, because its cue-window slices don't always land on a verbatim span, and **0 statements classified** — see below.
 
 **Two harness bugs were found and fixed while producing this table**, both of which had penalised all three extractors equally and hidden the real differences:
 
@@ -673,6 +687,82 @@ run_profile_agent()                                             # BLS, unchanged
 ```
 
 `build_profiles_from_transcripts()` returns `(profiles, results)` — the second element carries one `BridgeResult` per conversation **including the ones that produced no profile**, so callers can surface the follow-up questions. A conversation that did not build is a client to go back to, not an error to swallow.
+
+### Sorting statements, not just extracting fields (*Now and Forward* §3)
+
+Field extraction recovers typed values. It does not answer the question §3 poses: *"the things a client says are not all the same kind of object, and the system has to sort them before it can act."*
+
+`StatementKind` in `contracts.py` encodes the five categories, and `ClientStatement` carries each one with its quote, its subject, and — the load-bearing part — **its destinations**:
+
+| kind | what it is | typical destinations |
+|---|---|---|
+| `HARD_CONSTRAINT` | something the client will not hold | `universe_exclusion` |
+| `SOFT_PREFERENCE` | a tilt they'd like reflected, not binding | `bl_view` |
+| `RISK_FACT` | arrives sounding like a preference, is really an exposure | `concentration_limit` + `human_capital_beta` + `sector_underweight` |
+| `SUITABILITY_FACT` | horizon, liquidity, what is in or out of scope | `suitability_record`, `scope_boundary` |
+| `CHALLENGE` | a contradiction worth putting back to the client | `advisor_review` |
+
+`RISK_FACT` is the category the mentor calls *"the one that makes the whole exercise worthwhile"*, and the reason `destinations` is a **list**. Priya's ARVX holding is not a preference for her employer's stock — it is a concentration, a human-capital beta, and a forced sector underweight, from one passage.
+
+A validator enforces the thing that would otherwise quietly go wrong: **a statement with no destination raises.** Classifying a statement and then routing it nowhere is the same failure the review named at the top of Doc 1, one level up.
+
+**Classification is where the language model earns its cost — and this is measured, not asserted.** `transcript_generator.py` plants five statements per transcript (one of each kind, with their required destinations) as a classification answer key, on the same principle as the field key: the ground truth is the input that produced the transcript, not something read back out of it.
+
+76 planted statements, scored by `intake_eval.py`:
+
+| metric | rule_based | naive | **structured** |
+|---|---|---|---|
+| statements returned | 0 | 0 | 272 |
+| recall | 0% | 0% | **100%** |
+| kind accuracy | n/a | n/a | **81.6%** |
+| destinations complete | n/a | n/a | **100%** |
+
+Recall is 100% for **every** kind — hard constraint, soft preference, risk fact, suitability fact, challenge — and so is kind accuracy and destination completeness.
+
+**Kind accuracy started at 81.6%, and the diagnosis matters more than the number.** Adding a confusion matrix to the scorer showed all 7 errors were a single pair: `challenge → risk_fact`. The cause was the answer key, not the classifier. The planted challenge read *"Pretty cautious, I'd say. Though I suppose most of what I own is in the one stock"* — which **asserts a concentration**, and asserted it for all nine personas including the six holding no employer stock at all. That is a risk fact wearing a challenge's label, so a classifier filing it as `risk_fact` was reading it correctly.
+
+Three fixes, in descending order of how much they mattered:
+
+1. **The planted challenge is now a genuine contradiction** — *"Pretty cautious, I'd say. Although I would like this to roughly double over the next ten years"* — two client statements that cannot both hold, with no exposure claim and nothing depending on the persona's holdings.
+2. **The prompt distinguishes the pair explicitly**: a risk fact states an exposure, a challenge states a contradiction between two things the client said, and a passage doing both should emit **two** statements rather than picking a winner.
+3. **The scorer no longer takes the first quote match.** Since one passage can legitimately yield several statements, it now prefers a kind match among the candidates — otherwise a correct multi-statement answer scored wrong purely on ordering.
+
+**Fixing it introduced a fourth bug, which is the useful part of the story.** The replacement challenge first read *"I would like this to roughly double over the next ten years"* — a clean contradiction with no exposure claim, and therefore correct on the axis being fixed. But it hands the extractor an **investment horizon** and a **growth objective**, both of which are planted as OMITTED refusal tests. Structured hallucination went from 0% to **52.9%** in a single run, every point of it an extractor correctly reading a horizon this generator had just put into the transcript.
+
+So a planted statement has two constraints, not one: it must be the kind it claims to be, **and** it must not mention any field planted as omitted. The final wording — *"Pretty cautious, I'd say. Though honestly a 30% drop wouldn't bother me all that much"* — satisfies both.
+
+`_assert_omissions_are_omitted()` now enforces the second constraint at generation time, raising if a transcript contains a phrase that would let an extractor legitimately recover a field its own answer key calls omitted. A first version tripped on the bare word "years" and fired on *"works out around 5% most years"*, so the cues are phrases — a guard that cries wolf gets switched off.
+
+This is the **fourth** harness bug this work has surfaced, after the missing value space, the unrounded `bonus_rate` key, and the mislabelled challenge. The pattern is consistent enough to state plainly in the paper: **most of the apparent capability gaps in this evaluation turned out to be specification gaps in the evaluation.** A 52-point swing in a headline metric caused by a single reworded sentence is also the argument for the guard — without it, that swing is silent and reads as a model regression.
+
+The floor scores **0%** — not because it does badly but because it does not implement classification. That is the point: on field extraction rule-based ties structured at 98.6%, so the language model buys nothing. On sorting prose into constraints, preferences, exposures and contradictions, the gap is total rather than incremental.
+
+---
+
+## The Reference Discovery Call
+
+`agents/profile/reference_case.py` runs the mentor's own example, `intake_priya_raman.txt`, through the whole path. Until this existed, the intake layer had **only** ever been tested on transcripts this repo generated itself — uniform speaker turns, fixed phrasings, facts planted at chosen salience. The 98.6% was measured entirely on that corpus.
+
+**The real call broke two things the synthetic corpus could not have caught.**
+
+1. **It is advisor prose notes, not a dialogue.** There are no `CLIENT:` lines. The rule-based extractor read only those, so it recovered **0 of 12 fields — with no error**. `_client_voice` / `_advisor_voice` now handle both formats; in prose notes, attribution is decided per fact via advisor-judgement cues ("I'd put her at…", "when I floated…") rather than per line.
+
+2. **`RSU_concentration` came back as `360000`** — the dollar figure, for a field the contract bounds to `[0, 1]`. The prompt never stated units, and the failure surfaced at the bridge, one layer from the cause. `FIELD_UNITS` now states them.
+
+Current result on the real call:
+
+| | fields recovered | statements classified |
+|---|---|---|
+| rule_based | **1 of 14** | 0 (cannot classify) |
+| structured | **13 of 14** | 18 |
+
+The one refusal is `has_pension`, which genuinely never comes up — correct behaviour, not a miss.
+
+**What it produces.** Human capital $4,834,483 against financial capital $905,000 — **84.2% of her total wealth is her career**. Income beta 1.910 (equity-like), implicit equity exposure **1.608** against a risk budget of 0.66, giving a portfolio equity target of **−0.945**. Before she opens a brokerage account she is already over-exposed to equities, and the $360k of ARVX sits on top of that. Her holdings are extracted from the transcript, so the profile carries **ARVX at 39.8%** rather than a neutral default book.
+
+Two statements are routed to `advisor_review` as challenges, both of which are the contradiction the mentor names: she describes herself as middle-of-the-road while holding a double-barrelled biotech bet, and she reports discomfort with the ARVX position while having taken no action on it.
+
+And the source conflict fires on the real numbers — the transcript's advisor-supplied β of 1.20 against the calibration's 1.910, with the calibration used and the disagreement recorded.
 
 ---
 

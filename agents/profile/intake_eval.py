@@ -41,6 +41,7 @@ import pandas as pd
 
 from contracts import ExtractedProfile, FactSource
 from agents.profile.transcript_generator import (
+    PlantedStatement,
     Salience,
     TranscriptCase,
     generate_corpus,
@@ -84,6 +85,38 @@ class FieldOutcome:
     should_refuse:    bool
     refusal_correct:  bool
     asked_follow_up:  bool
+
+
+@dataclass
+class ClassificationScore:
+    """
+    How well an extractor sorted the conversation, not just mined it.
+
+    Scored separately from field extraction because it is a different
+    capability. Without this the claim "classification is where the language
+    model earns its cost" is asserted rather than measured — and the Week 7
+    standing rule is that a change cites the harness number it improved.
+    """
+
+    extractor:   str
+    n_planted:   int = 0
+    n_returned:  int = 0
+    recall:      float | None = None
+    """Fraction of planted statements matched by a returned statement of the same kind."""
+    kind_accuracy: float | None = None
+    """Of matched statements, the fraction classified with the correct kind."""
+    destination_recall: float | None = None
+    """Of correctly-matched statements, the fraction carrying every required destination."""
+    per_kind_recall: dict[str, float] = dc_field(default_factory=dict)
+    confusions: dict[str, int] = dc_field(default_factory=dict)
+    """
+    "planted_kind -> assigned_kind" counts for every mislabelled statement.
+
+    Kind accuracy alone says a fifth of statements are filed wrong; it does not
+    say which pairs are being conflated, and the fix depends entirely on that.
+    Guessing at prompt wording without this is how you end up tuning against
+    noise.
+    """
 
 
 @dataclass
@@ -182,6 +215,89 @@ def grade(case: TranscriptCase, extracted: ExtractedProfile) -> list[FieldOutcom
     return outcomes
 
 
+def _quote_overlap(a: str, b: str) -> bool:
+    """
+    Whether two quotes refer to the same passage.
+
+    Classifiers trim, extend, or re-punctuate the span they copy, so exact
+    equality would score correct classifications as misses. Substring
+    containment either way, on a normalised prefix, is the loosest test that
+    still cannot match two genuinely different sentences.
+    """
+    a, b = " ".join(a.lower().split()), " ".join(b.lower().split())
+    if not a or not b:
+        return False
+    return a[:60] in b or b[:60] in a
+
+
+def score_classification(
+    cases: list[TranscriptCase],
+    extracted_by_case: dict[str, "ExtractedProfile"],
+    extractor: str,
+) -> ClassificationScore:
+    """
+    Score one extractor's statement classification against the planted key.
+
+    A planted statement counts as recalled when the extractor returned a
+    statement quoting the same passage. Kind and destinations are then scored
+    only on those matches, so a classifier is not penalised twice for missing a
+    statement it never saw.
+    """
+    total = matched = right_kind = full_destinations = returned = 0
+    per_kind_hits: dict[str, list[int]] = {}
+    confusions: dict[str, int] = {}
+
+    for case in cases:
+        got = extracted_by_case.get(case.transcript_id)
+        statements = list(got.statements) if got else []
+        returned += len(statements)
+
+        for planted in case.planted_statements:
+            total += 1
+            hits = per_kind_hits.setdefault(planted.kind, [])
+
+            # One passage can legitimately produce several statements — the
+            # prompt asks for exactly that when a sentence both states an
+            # exposure and contradicts something said earlier. Taking the first
+            # quote match would then score a correct multi-statement answer as
+            # wrong purely on ordering, so prefer a kind match among the
+            # candidates and fall back to the first.
+            candidates = [s for s in statements if _quote_overlap(planted.quote, s.quote)]
+            if not candidates:
+                hits.append(0)
+                continue
+            match = next(
+                (s for s in candidates if s.kind.value == planted.kind), candidates[0]
+            )
+
+            matched += 1
+            hits.append(1)
+            if match.kind.value == planted.kind:
+                right_kind += 1
+                have = {d.value for d in match.destinations}
+                if set(planted.required_destinations).issubset(have):
+                    full_destinations += 1
+            else:
+                key = f"{planted.kind} -> {match.kind.value}"
+                confusions[key] = confusions.get(key, 0) + 1
+
+    def rate(num: int, den: int) -> float | None:
+        return round(num / den, 4) if den else None
+
+    return ClassificationScore(
+        extractor          = extractor,
+        n_planted          = total,
+        n_returned         = returned,
+        recall             = rate(matched, total),
+        kind_accuracy      = rate(right_kind, matched),
+        destination_recall = rate(full_destinations, right_kind),
+        per_kind_recall    = {
+            k: round(sum(v) / len(v), 4) for k, v in sorted(per_kind_hits.items()) if v
+        },
+        confusions         = dict(sorted(confusions.items(), key=lambda kv: -kv[1])),
+    )
+
+
 def score(outcomes: list[FieldOutcome], extractor: str) -> ExtractorScore:
     """Aggregate graded cells into the five reported properties."""
     cells = [o for o in outcomes if o.extractor == extractor]
@@ -252,22 +368,29 @@ def run(save: bool = True, include_llm: bool = True) -> dict:
 
     all_outcomes: list[FieldOutcome] = []
     failures: list[str] = []
+    extracted_by: dict[str, dict[str, ExtractedProfile]] = {}
 
     for extractor in extractors:
+        extracted_by[extractor.name] = {}
         for case in cases:
             try:
                 extracted = extractor.extract(
                     case.text, case.client_id, case.transcript_id
                 )
+                extracted_by[extractor.name][case.transcript_id] = extracted
                 all_outcomes.extend(grade(case, extracted))
             except Exception as e:
                 failures.append(f"{extractor.name} / {case.transcript_id}: {e}")
 
     scores = [score(all_outcomes, e.name) for e in extractors]
+    class_scores = [
+        score_classification(cases, extracted_by[e.name], e.name) for e in extractors
+    ]
     report = {
         "n_transcripts": len(cases),
         "n_personas":    len(personas),
         "extractors":    [asdict(s) for s in scores],
+        "classification": [asdict(s) for s in class_scores],
         "failures":      failures,
     }
 
@@ -316,6 +439,30 @@ def _print_report(report: dict, extractors) -> None:
     ]
     for label, getter in rows:
         print(f"{label:26s}" + "".join(f"{fmt(getter(s)):>14s}" for s in report["extractors"]))
+
+    cls = report.get("classification", [])
+    if cls:
+        print(f"\n=== Statement classification ({cls[0]['n_planted']} planted per extractor) ===")
+        print(f"{'metric':26s}" + "".join(f"{c['extractor']:>14s}" for c in cls))
+        for label, key in (
+            ("statements returned",  "n_returned"),
+            ("recall",               "recall"),
+            ("kind accuracy",        "kind_accuracy"),
+            ("destinations complete","destination_recall"),
+        ):
+            row = "".join(
+                f"{(('%6d' % c[key]) if key == 'n_returned' else fmt(c[key])):>14s}"
+                for c in cls
+            )
+            print(f"{label:26s}{row}")
+
+        kinds = sorted({k for c in cls for k in c["per_kind_recall"]})
+        if kinds:
+            print(f"\n{'recall by kind':26s}" + "".join(f"{c['extractor']:>14s}" for c in cls))
+            for k in kinds:
+                print(f"  {k:24s}" + "".join(
+                    f"{fmt(c['per_kind_recall'].get(k)):>14s}" for c in cls
+                ))
 
     for s in report["extractors"]:
         if s["calibration"]:
