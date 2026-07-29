@@ -517,6 +517,19 @@ class ProfileAgentOutput(BaseModel):
     liquidity_needs:          LiquidityNeeds
     investment_objective:     InvestmentObjective
 
+    # ── Client mandates (folded in from the intake layer) ─────────────
+    client_statements: list[ClientStatement] = Field(
+        default_factory=list,
+        description=(
+            "Classified statements from the intake conversation, carried over from "
+            "ExtractedProfile.statements so the mandate survives into the pipeline. "
+            "Compliance Job 3 reads HARD_CONSTRAINT and SOFT_PREFERENCE statements to "
+            "verify the proposed portfolio honours the client's stated mandates "
+            "(e.g. exclusions, ESG). Empty for personas built without a transcript — "
+            "Job 3 then passes those checks vacuously."
+        ),
+    )
+
     # ── Validators ────────────────────────────────────────────────────
 
     @model_validator(mode="after")
@@ -1151,6 +1164,15 @@ class ComplianceInput(BaseModel):
     proposed_portfolio:   dict[str, float]
     allocation_rationale: dict[str, str]
     regime_change_flag:   RegimeChangeFlag
+    client_statements:    list[ClientStatement] = Field(
+        default_factory=list,
+        description=(
+            "Client mandate statements threaded through from "
+            "ProfileAgentOutput.client_statements. Consumed by Compliance Job 3 "
+            "(robo-adviser checks). Defaults to empty so pre-intake callers and "
+            "existing tests remain valid."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

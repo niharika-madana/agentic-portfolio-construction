@@ -160,6 +160,7 @@ def assemble_compliance_input(
             current_regime = macro.regime_label if macro.regime_change_detected else None,
             shift_date     = str(macro.regime_shift_date) if macro.regime_change_detected else None,
         ),
+        client_statements    = profile.client_statements,
     )
 
 

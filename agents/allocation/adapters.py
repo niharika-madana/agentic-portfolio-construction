@@ -162,19 +162,54 @@ def profile_to_allocation_input(
 # AllocationOutput → AllocationAgentOutput  (for Compliance)
 # ---------------------------------------------------------------------------
 
+def _position_rationale(w, sector: str, hc_type: str) -> str:
+    """
+    Distinct, position-specific rationale from one ticker's BL decomposition.
+
+    Deterministic — every position cites its own equilibrium weight, factor-view
+    tilt and human-capital offset, so each rationale is unique and grounded.
+    This satisfies Compliance Check 2.2 (client-specific) and Check 2.6
+    (differentiated across positions). When the Allocation Agent later generates
+    per-ticker LLM prose from the same decomposition (SCOPE §3.9), it supersedes
+    this deterministic floor.
+    """
+    if w.human_capital_offset > 0.001:
+        offset = f"tilted up from its market-cap weight to diversify the client's {hc_type} human capital"
+    elif w.human_capital_offset < -0.001:
+        offset = f"tilted down to avoid compounding the client's {hc_type} human capital exposure"
+    else:
+        offset = f"held near its market-cap weight given the client's {hc_type} human capital profile"
+    return (
+        f"{w.ticker} ({sector}) — {w.total_weight:.1%} of the risky sleeve: "
+        f"equilibrium {w.equilibrium_baseline:.1%}, factor-view tilt {w.view_tilt:+.1%}, "
+        f"human capital offset {w.human_capital_offset:+.1%}; {offset}."
+    )
+
+
 def allocation_output_to_agent_output(
     allocation_output: AllocationOutput,
 ) -> AllocationAgentOutput:
     """
     Bridge the internal BL AllocationOutput into the Compliance-facing
     AllocationAgentOutput format.
+
+    Each position gets its own rationale built from that position's weight
+    decomposition — not one portfolio-level narrative copied onto every ticker,
+    which fails Compliance Check 2.6 under Reg BI's per-recommendation care
+    obligation. The portfolio-level LLM narrative stays on
+    AllocationOutput.rationale for the executive summary.
     """
-    weights        = {w.ticker: w.total_weight for w in allocation_output.weights}
-    rationale_text = allocation_output.rationale
+    weights = {w.ticker: w.total_weight for w in allocation_output.weights}
+    hc_type = allocation_output.allocation_input.user_profile.human_capital.human_capital_type
+
+    rationale = {
+        w.ticker: _position_rationale(w, ETF_SECTORS.get(w.ticker, "Unknown"), hc_type)
+        for w in allocation_output.weights
+    }
 
     return AllocationAgentOutput(
         proposed_portfolio          = weights,
-        allocation_rationale        = {ticker: rationale_text for ticker in weights},
+        allocation_rationale        = rationale,
         revision                    = allocation_output.allocation_input.flag_iteration,
         prior_risk_flags            = [],
         prior_compliance_violations = [],

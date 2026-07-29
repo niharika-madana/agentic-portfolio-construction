@@ -61,6 +61,7 @@ from agents.compliance.constraint_checks import (
 from agents.compliance.content_checks import (
     check_hc_acknowledgment,
     check_rationale_completeness,
+    check_rationale_distinctness,
     check_rationale_specificity,
     check_volatility_suitability,
     check_weight_integrity,
@@ -704,6 +705,53 @@ class TestCheck25VolatilitySuitability:
         violations, passed, _ = check_volatility_suitability(ci, ro)
         assert not violations
         assert "check_2_5_volatility_suitability" in passed
+
+
+# ===========================================================================
+# Section 9b — Check 2.6: Rationale distinctness
+# ===========================================================================
+
+class TestCheck26RationaleDistinctness:
+
+    def test_distinct_rationales_pass(self):
+        # _VALID_RATIONALE has a different rationale per ticker.
+        ci = _make_compliance_input()
+        violations, passed = check_rationale_distinctness(ci)
+        assert not violations
+        assert "check_2_6_rationale_distinctness" in passed
+
+    def test_identical_rationales_flagged(self):
+        shared = (
+            "Broad exposure appropriate for the client's equity-like human capital "
+            "beta and technology-sector income concentration."
+        )
+        ci = _make_compliance_input(rationale={"VTI": shared, "BND": shared, "GLD": shared})
+        violations, passed = check_rationale_distinctness(ci)
+        assert not passed
+        assert any(
+            v.check == "check_2_6_rationale_distinctness" and "3 positions" in v.description
+            for v in violations
+        )
+        assert all(v.severity == Severity.MEDIUM for v in violations)
+
+    def test_passes_2_2_but_fails_2_6(self):
+        # A rationale rich in client-specific terms clears 2.2 for every ticker,
+        # yet being identical across positions still fails 2.6.
+        shared = (
+            "Human capital is equity-like with income beta and RSU concentration; "
+            "this hedges the technology sector exposure given the moderate risk tolerance."
+        )
+        ci = _make_compliance_input(rationale={"VTI": shared, "BND": shared, "GLD": shared})
+        spec_violations, _ = check_rationale_specificity(ci)
+        dist_violations, _ = check_rationale_distinctness(ci)
+        assert not spec_violations          # passes 2.2
+        assert dist_violations              # fails 2.6
+
+    def test_single_position_is_vacuous_pass(self):
+        ci = _make_compliance_input(portfolio={"VTI": 1.0}, rationale={"VTI": "solo"})
+        violations, passed = check_rationale_distinctness(ci)
+        assert not violations
+        assert "check_2_6_rationale_distinctness" in passed
 
 
 # ===========================================================================

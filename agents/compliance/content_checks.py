@@ -1,13 +1,15 @@
 """
 Job 2 — Content & Fiduciary Checks (Compliance-owned).
 
-Five checks:
-  2.1  Rationale completeness — every ticker has a rationale entry
-  2.2  Rationale specificity  — rationale cites client-specific context (not boilerplate)
-  2.3  HC acknowledgment      — RSU/beta exposure referenced when material
-  2.4  Weight integrity       — weights sum to 1.0, no negatives, min 2 positions
-  2.5  Volatility suitability — portfolio vol within band for stated risk tolerance
+Six checks:
+  2.1  Rationale completeness  — every ticker has a rationale entry
+  2.2  Rationale specificity   — rationale cites client-specific context (not boilerplate)
+  2.3  HC acknowledgment       — RSU/beta exposure referenced when material
+  2.4  Weight integrity        — weights sum to 1.0, no negatives, min 2 positions
+  2.5  Volatility suitability  — portfolio vol within band for stated risk tolerance
        (skipped with warning if Risk Agent did not supply portfolio_volatility_annual)
+  2.6  Rationale distinctness  — rationales are differentiated across positions, not
+       one portfolio-level narrative copied onto every ticker
 
 These are Compliance's own independent checks — they do not re-audit the
 Risk Agent (that is Job 1). They verify that the recommendation is complete,
@@ -377,3 +379,68 @@ def check_volatility_suitability(
         ))
 
     return violations, passed, False
+
+
+# ---------------------------------------------------------------------------
+# Check 2.6 — Rationale Distinctness
+# ---------------------------------------------------------------------------
+
+def check_rationale_distinctness(
+    compliance_input: ComplianceInput,
+) -> tuple[list[ComplianceViolation], list[str]]:
+    """
+    Reg BI's care obligation attaches to *each* recommendation. A portfolio
+    whose positions all carry one identical rationale has not been justified
+    position-by-position — even when that shared text is individually specific
+    and so clears Check 2.2. This catches the failure mode where the Allocation
+    Agent emits a single portfolio-level narrative and copies it onto every
+    ticker (adapters.allocation_output_to_agent_output).
+
+    Distinct from Check 2.2: 2.2 asks "does THIS rationale cite client-specific
+    terms?" (per position); 2.6 asks "are the rationales differentiated ACROSS
+    positions?" (portfolio-wide). A rationale can pass 2.2 and still fail 2.6 —
+    an identical energy-ETF and Treasury-ETF justification is specific to the
+    portfolio but not to either position.
+
+    Severity MEDIUM — the positions may be suitable, but the per-position
+    justification is not documented to a fiduciary standard.
+    """
+    violations: list[ComplianceViolation] = []
+    passed: list[str] = []
+    check = "check_2_6_rationale_distinctness"
+
+    rationale = compliance_input.allocation_rationale
+    if len(rationale) < 2:
+        return [], [check]  # nothing to differentiate across
+
+    # Group tickers by identical (whitespace-normalised) rationale text.
+    groups: dict[str, list[str]] = {}
+    for ticker, text in rationale.items():
+        groups.setdefault(text.strip(), []).append(ticker)
+
+    shared = {text: tks for text, tks in groups.items() if len(tks) > 1}
+    for text, tks in sorted(shared.items(), key=lambda kv: -len(kv[1])):
+        listed = ", ".join(sorted(tks)[:6]) + ("…" if len(tks) > 6 else "")
+        violations.append(ComplianceViolation(
+            check             = check,
+            severity          = Severity.MEDIUM,
+            description       = (
+                f"{len(tks)} positions share one identical rationale ({listed}); "
+                f"a portfolio-level narrative copied across positions is not a "
+                f"per-recommendation justification."
+            ),
+            rule_reference    = (
+                "SEC Reg BI — Care Obligation, per recommendation "
+                "(17 CFR 240.15l-1(a)(2)(ii))"
+            ),
+            responsible_agent = ResponsibleAgent.ALLOCATION.value,
+            action_required   = (
+                "Generate a distinct, position-specific rationale for each holding "
+                "from its own optimizer decomposition (equilibrium weight, view tilt, "
+                "HC offset) rather than reusing one portfolio-level narrative."
+            ),
+        ))
+
+    if not violations:
+        passed.append(check)
+    return violations, passed
