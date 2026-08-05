@@ -155,6 +155,14 @@ def build_snapshot(
             as_of             = pd.Timestamp(last_date).date(),
         )
 
+    # The six raw FRED signals (yield_curve, term_spread, fed_funds, unemployment,
+    # cpi, credit_spread) are deliberately NOT passed. They are deprecated on the
+    # contract and consumed by nothing downstream — the 24 Jul and 4 Aug minutes
+    # both ask this snapshot to carry only label, confidence and volatility. The
+    # full signal matrix stays available in RegimeRecord, regime_sequence.json and
+    # data/outputs/fred_macro_regimes.csv, so nothing is lost by omitting them
+    # here; omitting them is what stops new consumers appearing before the fields
+    # can be deleted outright.
     return MacroRegimeSnapshot(
         regime_change_evidence = evidence,
         as_of             = pd.Timestamp(last_date).date(),
@@ -163,10 +171,4 @@ def build_snapshot(
         regime_shift_date = pd.Timestamp(row["regime_shift_date"]).date(),
         regime_confidence = round(float(row["regime_confidence"]), 3),
         regime_volatility = round(float(row["regime_volatility"]), 4),
-        yield_curve       = round(float(row["yield_curve"]), 4),
-        term_spread       = round(float(row["term_spread"]), 4),
-        fed_funds         = round(float(row["fed_funds"]), 4),
-        unemployment      = round(float(row["unemployment"]), 4),
-        cpi               = round(float(row["cpi"]), 4),
-        credit_spread     = round(float(row["credit_spread"]), 4),
     )

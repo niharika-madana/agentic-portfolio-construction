@@ -1,7 +1,7 @@
 # Profile Agent — Design Document
 **AI Financial Advisor Pipeline | Agent 1 of 5**
 *Fordham MSQF Capstone 2026*
-*Last updated: 2026-07-20 (July 14 meeting action item — `implied_market_volatility` diagnostic added (σ_market = ρ × σ_income / β); calibration-inconsistency finding documented; corrected two doc errors: `income_stability` enum case in the example JSON, and the BLS OES parquet filename; added `tier_derivation.py` — a reproducible, executable check that recomputes `income_stability` tiers from encoded signals and asserts the result matches the declared label. Prior: 2026-07-02 — post-refactor sync, module structure consolidated into `profile_agent.py` + `profile_model.py` [loaders.py/hc_beta_table.py/personas.py/human_capital.py/beta.py removed]; income_stability proof-of-categorization added; output paths moved to `data/outputs/`. Prior: 2026-06-30 — schema alignment enforced; `include_percentile_variants` exposed; unit tests added; pandas pinned to 2.x)*
+*Last updated: 2026-08-05 (Aug 4 meeting action items 1-4, 6-7: sector-overlap guard added (`sector_guard.py`) and the GICS spelling mismatch that silently disabled the employer sector cap fixed; `llm_role` provenance flag added to `ProfileAgentOutput`; `run_profile_agent(validate=True)`; per-persona JSON archive with SHA-256 manifest; unit tests under `agents/profile/tests/`; end-to-end flow documented in `intake_flow.md`. Prior: 2026-07-20 (July 14 meeting action item — `implied_market_volatility` diagnostic added (σ_market = ρ × σ_income / β); calibration-inconsistency finding documented; corrected two doc errors: `income_stability` enum case in the example JSON, and the BLS OES parquet filename; added `tier_derivation.py` — a reproducible, executable check that recomputes `income_stability` tiers from encoded signals and asserts the result matches the declared label. Prior: 2026-07-02 — post-refactor sync, module structure consolidated into `profile_agent.py` + `profile_model.py` [loaders.py/hc_beta_table.py/personas.py/human_capital.py/beta.py removed]; income_stability proof-of-categorization added; output paths moved to `data/outputs/`. Prior: 2026-06-30 — schema alignment enforced; `include_percentile_variants` exposed; unit tests added; pandas pinned to 2.x)*
 
 ---
 
@@ -32,10 +32,26 @@ SCF 2022 (static table) → financial_capital by age × income quartile
           output  = to_profile_agent_output(profile)     ← Pydantic validation
                                ↓
         list[ProfileAgentOutput]  →  orchestrator.run_pipeline()
-        also saved as data/storage/profiles_all.parquet
 ```
 
 Single-pass architecture. Beta is known before `build_profile()` is called — there is no two-pass design.
+
+**There is a second entry path.** `run_profile_agent(transcripts=...)` builds the same
+persona dicts from client conversations instead of the BLS table
+(`intake.py` → `intake_bridge.py`), then hands them to the identical
+`build_profile()`. The formulas cannot tell where their inputs came from, so a
+transcript-built client and a BLS persona are computed the same way and are
+directly comparable. Full walkthrough with a diagram:
+[intake_flow.md](intake_flow.md).
+
+**Outputs** written by `save_profiles()`:
+
+| Path | Contents |
+|---|---|
+| `data/outputs/profiles_all.json` | All profiles as one array |
+| `data/outputs/profiles/<client_id>.json` | One archived profile per persona |
+| `data/outputs/profiles/SHA256SUMS` | Integrity manifest, `sha256sum -c` format |
+| `data/storage/profiles_all.parquet` | Consumed by Allocation / Risk / Compliance |
 
 ---
 
@@ -58,10 +74,31 @@ agents/profile/
 │                       asserts it matches the label in TARGET_OCCUPATIONS. See
 │                       [Tier Derivation — Reproducibility Check](#tier-derivation--reproducibility-check).
 │                       Run via `python -m agents.profile.tier_derivation`.
+├── intake.py           Transcript → typed facts. The Extractor protocol and its three
+│                       implementations (RuleBasedExtractor / StructuredExtractor /
+│                       NaiveExtractor), each declaring `uses_llm`. Computes no numbers.
+├── intake_bridge.py    ExtractedProfile → raw persona dict (to_persona), REQUIRED_FIELDS
+│                       gate, statement routing, and _llm_role_for() which resolves the
+│                       provenance flag. Returns BridgeResult carrying open_questions.
+├── intake_eval.py      Scores the extractors against an answer key — recall, precision
+│                       and refusal-to-guess. Run via `python -m agents.profile.intake_eval`.
+├── transcript_generator.py  Synthetic discovery calls with planted facts, for the
+│                       intake harness.
+├── sector_guard.py     check_sector_overlap() — pre-optimizer guard that a client's own
+│                       employment sector does not exceed its cap. See
+│                       [Sector Overlap Guard](#sector-overlap-guard).
+├── sensitivity.py      Input-perturbation analysis via build_profile(overrides=...) —
+│                       measures how input error propagates into portfolio weights.
+├── reference_case.py   Worked example reproducing this document's numbers end to end.
+├── profile_design.md   This document.
+├── intake_flow.md      End-to-end intake → bridge → profile flow, with diagram and the
+│                       exact list of files that must exist.
+├── tests/              Sector guard, llm_role, validate=True and archive tests.
+│                       Run with `uv run pytest agents/profile/tests`.
 └── __init__.py
 ```
 
-Unit tests live at the top-level `tests/test_profile.py` and `tests/test_human_capital.py` (no live API calls).
+Unit tests also live at the top-level `tests/test_profile.py` and `tests/test_human_capital.py` (no live API calls). `pyproject.toml` sets `testpaths = ["tests"]`, so a bare `pytest` does not collect `agents/profile/tests` — run that path explicitly, or add it to `testpaths`.
 
 > **Refactor note (post-June 30):** `loaders.py`, `hc_beta_table.py`, `personas.py`, `human_capital.py`, and the deprecated `beta.py` have all been **removed**. Their data-loading moved to `profile_agent.py`; everything else was consolidated inline into `profile_model.py`. Any `from loaders import ...` / `from hc_beta_table import ...` / `from beta import ...` must be updated to import from `profile_model` (or `profile_agent` for loaders).
 
@@ -340,17 +377,26 @@ The same flag is exposed on the entry point `run_profile_agent(include_percentil
 
 ### Target Occupations (9)
 
-| SOC | Label | Career Type | Income Stability | HC Type | Has Pension | RSU Eligible |
-|---|---|---|---|---|---|---|
-| 25-1042 | Biology Professor | Academia | High | bond-like | ✓ | — |
-| 29-1141 | Registered Nurse | Healthcare | High | bond-like | — | — |
-| 13-1041 | Compliance Officer | Government | High | bond-like | ✓ | — |
-| 23-1011 | Lawyer | Legal | Medium | mixed | — | — |
-| 17-2141 | Mechanical Engineer | Engineering | Medium | mixed | — | — |
-| 13-2051 | Financial Analyst | Finance | Medium | mixed | — | — |
-| 15-1252 | Software Developer | Technology | Low | equity-like | — | ✓ |
-| 11-3021 | IT Manager | Technology | Low | equity-like | — | ✓ |
-| 11-2022 | Sales Manager | Sales | Low | equity-like | — | — |
+| SOC | Label | Career Type | Employer Sector | Income Stability | HC Type | Has Pension | RSU Eligible |
+|---|---|---|---|---|---|---|---|
+| 25-1042 | Biology Professor | Academia | `Education` † | High | bond-like | ✓ | — |
+| 29-1141 | Registered Nurse | Healthcare | `Health Care` | High | bond-like | — | — |
+| 13-1041 | Compliance Officer | Government | `Government` † | High | bond-like | ✓ | — |
+| 23-1011 | Lawyer | Legal | `Legal` † | Medium | mixed | — | — |
+| 17-2141 | Mechanical Engineer | Engineering | `Industrials` | Medium | mixed | — | — |
+| 13-2051 | Financial Analyst | Finance | `Financials` | Medium | mixed | — | — |
+| 15-1252 | Software Developer | Technology | `Information Technology` | Low | equity-like | — | ✓ |
+| 11-3021 | IT Manager | Technology | `Information Technology` | Low | equity-like | — | ✓ |
+| 11-2022 | Sales Manager | Sales | `Consumer Discretionary` | Low | equity-like | — | — |
+
+† Non-investable — no listed sector ETF tracks it (`contracts.NON_INVESTABLE_EMPLOYER_SECTORS`). The sector-overlap guard is a deliberate no-op for these clients.
+
+**Career Type is descriptive; Employer Sector is load-bearing.** `career_type` is free
+text for reporting. `industry_exposure_sector` is matched by string equality against
+ETF sector labels downstream, so it must be a canonical `contracts.GICS_SECTORS` name
+or a recognised non-investable one — an import-time assertion in `profile_model.py`
+enforces this. See [Sector Overlap Guard](#sector-overlap-guard) for what went wrong
+when it wasn't.
 
 ---
 
@@ -452,10 +498,143 @@ The biology professor's bond-like income — a stable, government-indifferent sa
 
 ---
 
+## Sector Overlap Guard
+
+*Added 2026-08-05 — 4 Aug minutes, Profile/Research item 1.*
+
+A client's own employment sector is the one place their portfolio must not
+concentrate: their career is already an undiversified position in it. The guard
+lives in `sector_guard.py` and is called by the Allocation Agent before the
+optimizer returns.
+
+```python
+from agents.profile.sector_guard import check_sector_overlap
+
+check_sector_overlap(profile, weights, universe.sectors)   # raises on violation
+```
+
+The cap follows SCOPE.md §3.2 — `adjusted_limit = base_limit × (1 − ρ)` — over a
+base of 10%, matching `EMPLOYER_SECTOR_LIMIT` in
+`agents/shared/core/constraints.py`. For the software developer (ρ = 0.75) that is
+2.5%; for the biology professor (ρ = 0.10), 9%. Pass
+`correlation_adjusted=False` for the flat 10% cap.
+
+Employer sectors with no listed sector ETF — `Education`, `Government`,
+`Nonprofit`, `Legal` — make the check a deliberate no-op, reported as
+`applicable=False` rather than as a pass.
+
+### The spelling bug this closed
+
+`industry_exposure_sector` is matched by **string equality** against ETF sector
+labels in `agents/allocation/adapters.py` and `agents/shared/core/allocation.py`.
+Until 4 Aug, `TARGET_OCCUPATIONS` emitted:
+
+| Was | Downstream expects | Consequence |
+|---|---|---|
+| `Technology` | `Information Technology` | 10% employer sector cap never bound; XLK fell under the generic 20% limit. Employer proxy ETF fell through to **SPY instead of XLK** — the career was hedged against the wrong index. |
+| `Healthcare` | `Health Care` | Proxy ETF fell through to SPY instead of XLV. |
+| `Financial Services` | `Financials` | Proxy ETF fell through to SPY instead of XLF. |
+
+Nothing in Allocation or Risk raised. **Compliance did catch it**, via check 1.3b
+(`RSU > 10% → employer sector limit must be reduced`): because `employer_sector in
+risk_output.sector_limits` was `False`, it took the `else` branch and reported a
+MEDIUM violation — *"employer sector 'Technology' has no sector limit entry.
+Cannot verify HC concentration adjustment."* That is the audit layer working as
+designed, but it fired two agents downstream of the cause and named a symptom
+rather than the misspelling behind it.
+
+Confirmed by running the same persona both ways through the full pipeline:
+
+| Employer sector | Employer proxy ETF | Check 1.3b |
+|---|---|---|
+| `Technology` (pre-4-Aug) | **SPY** | **VIOLATED** — MEDIUM, no sector limit entry |
+| `Information Technology` | **XLK** | **PASSED** |
+
+This affected both RSU-heavy tech personas — exactly the clients the human-capital
+framework exists to protect. Fixing the spelling removes the violation at its
+source; it does not suppress the check.
+
+Three things now prevent recurrence:
+
+1. `contracts.normalize_sector()` runs as a field validator on
+   `ProfileAgentOutput`, so aliases are canonicalised at the contract boundary.
+2. An import-time assertion in `profile_model.py` rejects any
+   `TARGET_OCCUPATIONS` sector that is neither a GICS sector nor a recognised
+   non-investable one.
+3. `agents/profile/tests/test_sector_guard.py::TestPersonaSectorsAreMatchable`
+   asserts every persona sector resolves to a real ETF sector and proxy ticker.
+
+---
+
+## Provenance — `llm_role`
+
+*Added 2026-08-05 — 4 Aug minutes, Profile/Research item 2.*
+
+`ProfileAgentOutput.llm_role` records what the language model actually did in
+producing **that** profile:
+
+| Value | When |
+|---|---|
+| `"none"` | BLS occupation path, or the deterministic `RuleBasedExtractor`. No model ran. |
+| `"creator"` | A model authored the structured inputs — the transcript path via `StructuredExtractor` or `NaiveExtractor`. |
+
+It is resolved from the extractor's own `uses_llm` class attribute, not from a
+name match, so a new extractor reports itself correctly. An unrecognised extractor
+reports `creator`: over-reporting model involvement is the safe direction to be
+wrong in for an audit trail.
+
+The value never changes a computed number — every figure comes from
+`build_profile()` either way, and a test asserts the two runs are identical apart
+from the flag itself. The minutes describe this as confirming "the LLM-to-math
+role reversal"; what the field actually certifies is the standing rule in
+SCOPE.md §2.6 — models supply text and facts, deterministic code supplies figures.
+Recording it per profile rather than asserting it once makes the claim checkable
+against the artifact.
+
+---
+
+## Validation and Archive
+
+*Added 2026-08-05 — 4 Aug minutes, Profile/Research items 3 and 4.*
+
+```python
+profiles = run_profile_agent(validate=True)
+```
+
+Turns the run into an assertion. Every expected persona must build, pass Pydantic
+validation, and survive a JSON round-trip, or `ProfileValidationError` names the
+missing `client_id`s. This closes two silent-skip paths that compound:
+`build_bls_personas()` skips missing SOC codes and suppressed wage cells with a
+printed warning, and `build_profiles()` skips validation failures the same way. A
+run that emits two warnings into a long log and returns seven profiles is
+otherwise indistinguishable from a successful one.
+
+`validate` is opt-in, not the default, because the two behaviours serve different
+callers: a percentile sweep genuinely wants the partial result rather than losing
+26 good personas to one suppressed wage cell. It is rejected outright on the
+transcript path, where an incomplete result is the expected outcome — a client who
+never mentioned their salary produces open questions, not a failure.
+
+`save_profiles()` additionally writes a per-persona archive:
+
+```
+data/outputs/profiles/bls_15-1252_p50.json     one file per persona
+data/outputs/profiles/SHA256SUMS               sha256sum -c format
+```
+
+One file per persona rather than one array because the purpose is regression
+evidence: a diff on `bls_15-1252_p50.json` names the client that changed. Hashes
+are taken over the exact bytes written with sorted keys, so identical profiles
+always hash identically. Verify with `shasum -a 256 -c SHA256SUMS` or
+`verify_archive()`.
+
+---
+
 ## Output Schema
 
-`ProfileAgentOutput` is defined in `contracts.py` and validated by four `model_validator` functions. Field names and types here are the authoritative schema. The root `contracts.py` is the single definition site — the per-agent `contracts.py` files this section used to reference (carrying `RiskAgentInput` / `ProfileContextForResearch`) no longer exist, and neither do those types; a rename now needs updating only in `contracts.py` and its consumers:
+`ProfileAgentOutput` is defined in `contracts.py` and validated by one `field_validator` and four `model_validator` functions. Field names and types here are the authoritative schema. The root `contracts.py` is the single definition site — the per-agent `contracts.py` files this section used to reference (carrying `RiskAgentInput` / `ProfileContextForResearch`) no longer exist, and neither do those types; a rename now needs updating only in `contracts.py` and its consumers:
 
+0. `_canonical_sector` (`field_validator`) — normalises `industry_exposure_sector` to the canonical GICS spelling via `normalize_sector()`. Runs before the model validators. Does **not** reject unknown sectors; see [Sector Overlap Guard](#sector-overlap-guard).
 1. `_check_holdings_sum` — `current_holdings` weights must sum to 1.0 ± 0.01
 2. `_check_total_wealth_consistency` — `total_wealth == financial_capital + human_capital_valuation` within 0.5%
 3. `_check_implicit_equity_exposure` — enforces `hc_share × β` within 0.01 tolerance
@@ -496,7 +675,8 @@ Example output for Biology Professor (p50, r = 4.4%):
   "investment_horizon_years": 18,
   "risk_tolerance_level": "moderate",
   "liquidity_needs": "low",
-  "investment_objective": "growth"
+  "investment_objective": "growth",
+  "llm_role": "none"
 }
 ```
 

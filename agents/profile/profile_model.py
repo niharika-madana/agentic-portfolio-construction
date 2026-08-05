@@ -13,7 +13,12 @@ from __future__ import annotations
 
 import pandas as pd
 
-from contracts import ProfileAgentOutput
+from contracts import (
+    GICS_SECTORS,
+    NON_INVESTABLE_EMPLOYER_SECTORS,
+    LLMRole,
+    ProfileAgentOutput,
+)
 
 
 # ===========================================================================
@@ -194,6 +199,7 @@ def build_profile(
     persona: dict,
     discount_rate: float,
     overrides: dict[str, float] | None = None,
+    llm_role: LLMRole = LLMRole.NONE,
 ) -> dict:
     """
     Derive all computed fields from a raw BLS persona dict.
@@ -216,6 +222,12 @@ def build_profile(
         When beta is not overridden it stays derived from the (possibly
         overridden) sigma and correlation, so the single-factor identity
         beta = rho * sigma_income / SIGMA_MARKET continues to hold.
+    llm_role : LLMRole
+        Who supplied the inputs in `persona`. Defaults to NONE, which is correct
+        for the BLS path — no model runs there. The transcript path passes
+        CREATOR when an LLM extractor produced the facts; see
+        intake_bridge.build_profile_from_intake(). It never changes a computed
+        number, only what the profile records about its own provenance.
     """
     overrides = overrides or {}
 
@@ -280,6 +292,7 @@ def build_profile(
         "risk_tolerance_level":       persona["risk_tolerance"],
         "liquidity_needs":            persona["liquidity_needs"],
         "investment_objective":       persona["investment_objective"],
+        "llm_role":                   llm_role,
     }
 
 
@@ -346,15 +359,24 @@ INCOME_STABILITY_BASIS = {
 # https://www.bls.gov/oes/2023/may/oes_nat.htm
 # income_stability per row is justified in INCOME_STABILITY_BASIS above; the two
 # are kept in sync by the integrity check immediately following this table.
+#
+# `sector` uses the canonical GICS spelling from contracts.GICS_SECTORS, or one of
+# contracts.NON_INVESTABLE_EMPLOYER_SECTORS where no listed sector tracks the
+# employer. This is load-bearing, not cosmetic: agents/allocation/adapters.py keys
+# _SECTOR_PROXY_ETF and agents/shared/core/allocation.py keys the 10% employer
+# sector cap on this exact string. Until 4 Aug these rows read "Technology",
+# "Healthcare" and "Financial Services", none of which match an ETF sector, so the
+# two RSU-heavy tech personas were hedged against SPY instead of XLK and were
+# capped at the generic 20% sector limit instead of 10%. Neither failure raised.
 TARGET_OCCUPATIONS = [
     {"soc": "25-1042", "label": "Biology Professor",   "career_type": "Academia",    "income_stability": "High",   "has_pension": True,  "rsu_eligible": False, "sector": "Education"},
-    {"soc": "29-1141", "label": "Registered Nurse",    "career_type": "Healthcare",  "income_stability": "High",   "has_pension": False, "rsu_eligible": False, "sector": "Healthcare"},
+    {"soc": "29-1141", "label": "Registered Nurse",    "career_type": "Healthcare",  "income_stability": "High",   "has_pension": False, "rsu_eligible": False, "sector": "Health Care"},
     {"soc": "13-1041", "label": "Compliance Officer",  "career_type": "Government",  "income_stability": "High",   "has_pension": True,  "rsu_eligible": False, "sector": "Government"},
     {"soc": "23-1011", "label": "Lawyer",              "career_type": "Legal",       "income_stability": "Medium", "has_pension": False, "rsu_eligible": False, "sector": "Legal"},
     {"soc": "17-2141", "label": "Mechanical Engineer", "career_type": "Engineering", "income_stability": "Medium", "has_pension": False, "rsu_eligible": False, "sector": "Industrials"},
-    {"soc": "13-2051", "label": "Financial Analyst",   "career_type": "Finance",     "income_stability": "Medium", "has_pension": False, "rsu_eligible": False, "sector": "Financial Services"},
-    {"soc": "15-1252", "label": "Software Developer",  "career_type": "Technology",  "income_stability": "Low",    "has_pension": False, "rsu_eligible": True,  "sector": "Technology"},
-    {"soc": "11-3021", "label": "IT Manager",          "career_type": "Technology",  "income_stability": "Low",    "has_pension": False, "rsu_eligible": True,  "sector": "Technology"},
+    {"soc": "13-2051", "label": "Financial Analyst",   "career_type": "Finance",     "income_stability": "Medium", "has_pension": False, "rsu_eligible": False, "sector": "Financials"},
+    {"soc": "15-1252", "label": "Software Developer",  "career_type": "Technology",  "income_stability": "Low",    "has_pension": False, "rsu_eligible": True,  "sector": "Information Technology"},
+    {"soc": "11-3021", "label": "IT Manager",          "career_type": "Technology",  "income_stability": "Low",    "has_pension": False, "rsu_eligible": True,  "sector": "Information Technology"},
     {"soc": "11-2022", "label": "Sales Manager",       "career_type": "Sales",       "income_stability": "Low",    "has_pension": False, "rsu_eligible": False, "sector": "Consumer Discretionary"},
 ]
 
@@ -371,6 +393,18 @@ for _occ in TARGET_OCCUPATIONS:
         f"income_stability mismatch for SOC {_occ['soc']} ({_occ['label']}): "
         f"TARGET_OCCUPATIONS says {_occ['income_stability']!r}, "
         f"INCOME_STABILITY_BASIS says {_basis['tier']!r}."
+    )
+    # Sector spelling must be one downstream agents can actually match. Checked at
+    # import so a hand-edit reintroducing a near-miss ("Technology") fails loudly
+    # rather than silently disabling the employer sector cap and proxy ETF.
+    assert (
+        _occ["sector"] in GICS_SECTORS
+        or _occ["sector"] in NON_INVESTABLE_EMPLOYER_SECTORS
+    ), (
+        f"TARGET_OCCUPATIONS[{_occ['soc']}] sector {_occ['sector']!r} is neither a "
+        f"GICS sector nor a recognised non-investable employer sector. Downstream "
+        f"sector caps and employer proxy ETFs match this string exactly and fail "
+        f"open when it does not."
     )
 
 # Representative career-midpoint age per SOC (for HC annuity horizon n = 65 − age).

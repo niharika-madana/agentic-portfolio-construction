@@ -140,8 +140,14 @@ def _save_outputs(features_df, regime_sequence: dict, snapshot: MacroRegimeSnaps
         json.dump(regime_sequence, f, indent=2)
     print(f"Saved → {SEQUENCE_OUTPUT}")
 
+    # The six deprecated raw FRED signals are excluded rather than written as
+    # nulls. Per the 24 Jul and 4 Aug minutes this file carries the three fields
+    # allocation actually consumes — regime_label, regime_confidence,
+    # regime_volatility — plus the identity and flag fields the orchestrator reads.
+    # The full signal matrix is still written to fred_macro_regimes.csv and
+    # regime_sequence.json two lines above, so nothing is lost here.
     with open(SNAPSHOT_OUTPUT, "w") as f:
-        f.write(snapshot.model_dump_json(indent=2))
+        f.write(snapshot.model_dump_json(indent=2, exclude=MacroRegimeSnapshot.DEPRECATED_FIELDS))
     print(f"Saved → {SNAPSHOT_OUTPUT}")
 
 

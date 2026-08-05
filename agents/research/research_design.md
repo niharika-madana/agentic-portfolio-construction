@@ -1,7 +1,7 @@
 # Research Agent — Design Document
 **AI Financial Advisor Pipeline | Agent 2 of 5**
 *Fordham MSQF Capstone 2026*
-*Last updated: 2026-06-30 (June 30 session — PELT parameters exposed as named constants; cluster_segments() refactored with race-condition guard and input validation; HMM/GMM isolated to non-production path; schema alignment notes added; export paths consolidated; pandas pinned to 2.x; Cell 10 segment duration corrected to 19 mo)*
+*Last updated: 2026-08-05 (Aug 4 meeting, Research item 5 — the six deprecated raw FRED signals are now optional on the contract, no longer populated by `build_snapshot()`, and no longer written to `macro_regime_snapshot.json`; only the `tests/` fixture references remain before they can be deleted outright. Prior: 2026-06-30 (June 30 session — PELT parameters exposed as named constants; cluster_segments() refactored with race-condition guard and input validation; HMM/GMM isolated to non-production path; schema alignment notes added; export paths consolidated; pandas pinned to 2.x; Cell 10 segment duration corrected to 19 mo)*
 
 ---
 
@@ -620,7 +620,17 @@ Use **`snapshot.for_allocation()`** instead — it returns the intended minimal 
 {"regime_label": ..., "regime_confidence": ..., "regime_volatility": ...}
 ```
 
-Code written against `for_allocation()` will not need changing when the deprecated fields are finally deleted, which is a one-line-per-field edit once the test fixtures can be updated. Nothing is lost by dropping them: the full signal matrix remains in `RegimeRecord` and in `data/outputs/fred_macro_regimes.csv`.
+Code written against `for_allocation()` will not need changing when the deprecated fields are finally deleted. Nothing is lost by dropping them: the full signal matrix remains in `RegimeRecord` and in `data/outputs/fred_macro_regimes.csv`.
+
+### Status — 4 Aug update
+
+The 4 Aug minutes repeat the ask as Research item 5. The half that can be done without touching `tests/` is now done:
+
+1. **The six fields are `Optional` with `default=None`** and carry pydantic's `deprecated=True`. New code — including `build_snapshot()` — no longer passes them, so nothing further can come to depend on them. The existing fixtures that *do* pass them keep working unchanged.
+2. **`build_snapshot()` no longer populates them.** `agents/research/adapters.py` constructs the snapshot from label, confidence, volatility and the identity/evidence fields only.
+3. **`data/outputs/macro_regime_snapshot.json` no longer contains them.** `_save_outputs()` serialises with `exclude=MacroRegimeSnapshot.DEPRECATED_FIELDS`, so they are omitted rather than written as nulls — a null is a worse artifact than the number was, because a reader cannot tell a retired field from a failed computation.
+
+What remains is deleting the six lines from `contracts.py`, which is now purely mechanical: **there is no production caller left to update**, only the ~11 fixture references in `tests/test_research.py` and `tests/test_compliance.py`. That is a change for whoever owns `tests/`.
 
 ### Consumption
 
@@ -636,10 +646,14 @@ Code written against `for_allocation()` will not need changing when the deprecat
 - **Environment:** pandas pinned to `>=2.0,<3.0` across all agents (pandas 3.x caused parquet load errors — team decision June 25 2026)
 - Dependencies: `fredapi`, `xgboost`, `scikit-learn`, `matplotlib`, `ruptures`, `pydantic`, `scipy`, `pyarrow`, `"pandas>=2.0,<3.0"`
 - `hmmlearn` — installed but **not imported in the production path**; only used in the manually-executed HMM/GMM comparison section of the notebook
-- Output files:
-  - `agents/research/fred_macro_regimes.csv` — full feature matrix with smoothed regime labels
-  - `agents/research/regime_sequence.json` — validated regime sequence passed downstream
-  - `agents/research/macro_regime_snapshot.json` — most recent month `MacroRegimeSnapshot`
+- Output files (paths corrected 2026-08-05 — these moved to `data/outputs/` in the
+  July refactor and this list still pointed at `agents/research/`; the constants are
+  `CSV_OUTPUT` / `SEQUENCE_OUTPUT` / `SNAPSHOT_OUTPUT` in `research_agent.py`):
+  - `data/outputs/fred_macro_regimes.csv` — full feature matrix with smoothed regime labels
+  - `data/outputs/regime_sequence.json` — validated regime sequence passed downstream
+  - `data/outputs/macro_regime_snapshot.json` — most recent month `MacroRegimeSnapshot`,
+    written **without** the six deprecated raw FRED signals (see
+    [Snapshot Surface — Deprecation](#snapshot-surface--deprecation-24-jul-research-action))
   - `data/storage/fred_macro.parquet` — cached FRED macro data (fetched once)
   - `data/storage/crsp_market_index.parquet` — cached CRSP returns (converted from CSV once)
   - `data/storage/fred_macro_regimes.parquet` — full feature matrix for downstream agents

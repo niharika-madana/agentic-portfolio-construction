@@ -156,6 +156,17 @@ class Extractor(Protocol):
 
     name: str
 
+    uses_llm: bool
+    """
+    Whether this strategy calls a language model.
+
+    Declared by the extractor rather than inferred from its name, because the
+    answer travels: it is what sets ProfileAgentOutput.llm_role, which is the
+    field the oral defense points at to show which profiles a model touched. A
+    name-matching heuristic in the bridge would quietly get this wrong the first
+    time someone adds an extractor.
+    """
+
     def extract(self, transcript: str, client_id: str, transcript_id: str) -> ExtractedProfile:
         ...
 
@@ -334,6 +345,7 @@ class RuleBasedExtractor:
     """
 
     name = "rule_based"
+    uses_llm = False
 
     def extract(self, transcript: str, client_id: str, transcript_id: str) -> ExtractedProfile:
         lines = transcript.split("\n")
@@ -471,6 +483,7 @@ class NaiveExtractor:
     """
 
     name = "naive"
+    uses_llm = True
 
     def __init__(self, model: str = DEFAULT_MODEL):
         self.model = model
@@ -655,6 +668,7 @@ class StructuredExtractor:
     """
 
     name = "structured"
+    uses_llm = True
 
     def __init__(self, model: str = DEFAULT_MODEL, classify: bool = True):
         self.model = model

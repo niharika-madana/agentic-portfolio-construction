@@ -23,14 +23,124 @@ from __future__ import annotations
 
 from datetime import date
 from enum import Enum
-from typing import Optional
+from typing import ClassVar, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+# ---------------------------------------------------------------------------
+# Shared vocabularies
+# ---------------------------------------------------------------------------
+
+GICS_SECTORS: frozenset[str] = frozenset({
+    "Communication Services",
+    "Consumer Discretionary",
+    "Consumer Staples",
+    "Energy",
+    "Financials",
+    "Health Care",
+    "Industrials",
+    "Information Technology",
+    "Materials",
+    "Real Estate",
+    "Utilities",
+})
+"""
+The eleven GICS sectors, spelled exactly as the Allocation Agent's ETF sector
+map spells them.
+
+This is a shared vocabulary, not a Profile Agent detail. `industry_exposure_sector`
+is matched by STRING EQUALITY on the allocation and risk side — an employer sector
+of "Technology" does not match the ETF sector "Information Technology", so the
+employer sector cap silently degrades to the generic sector limit and the employer
+proxy ETF silently degrades to SPY. Both failures are invisible: no exception, no
+warning, just a portfolio that was never actually constrained.
+
+Keep this set and `agents/allocation/adapters.ETF_SECTORS` in agreement.
+"""
+
+NON_INVESTABLE_EMPLOYER_SECTORS: frozenset[str] = frozenset({
+    "Education",
+    "Government",
+    "Nonprofit",
+    "Legal",
+})
+"""
+Employer sectors with no GICS equivalent, because no listed sector ETF tracks them.
+
+These are legitimate values for `industry_exposure_sector` — a tenured professor's
+employer really is not in an investable sector — and the sector-overlap guard is a
+deliberate no-op for them. They are enumerated rather than allowed implicitly so
+that a genuine typo ("Techonlogy") is still distinguishable from an honest absence.
+"""
+
+_SECTOR_ALIASES: dict[str, str] = {
+    "technology":         "Information Technology",
+    "tech":               "Information Technology",
+    "information technology": "Information Technology",
+    "it":                 "Information Technology",
+    "healthcare":         "Health Care",
+    "health care":        "Health Care",
+    "financial services": "Financials",
+    "finance":            "Financials",
+    "financials":         "Financials",
+    "consumer discretionary": "Consumer Discretionary",
+    "consumer staples":   "Consumer Staples",
+    "communication services": "Communication Services",
+    "energy":             "Energy",
+    "industrials":        "Industrials",
+    "materials":          "Materials",
+    "real estate":        "Real Estate",
+    "utilities":          "Utilities",
+    "education":          "Education",
+    "government":         "Government",
+    "nonprofit":          "Nonprofit",
+    "legal":              "Legal",
+}
+
+
+def normalize_sector(sector: str) -> str:
+    """
+    Map an employer sector onto the canonical GICS spelling.
+
+    Case- and spacing-insensitive, so "technology", "Technology" and
+    "  TECHNOLOGY " all land on "Information Technology". Unrecognised values are
+    returned stripped but otherwise untouched: this normalises vocabulary, it does
+    not invent a classification for a sector nobody has mapped yet. Use
+    `is_investable_sector()` to tell whether the result can be matched against an
+    ETF sector map.
+    """
+    if not isinstance(sector, str):
+        return sector
+    return _SECTOR_ALIASES.get(sector.strip().lower(), sector.strip())
+
+
+def is_investable_sector(sector: str) -> bool:
+    """True when `sector` names a GICS sector with a corresponding sector ETF."""
+    return normalize_sector(sector) in GICS_SECTORS
 
 
 # ---------------------------------------------------------------------------
 # Shared enums
 # ---------------------------------------------------------------------------
+
+class LLMRole(str, Enum):
+    """
+    What the language model actually did in producing a given profile.
+
+    Recorded per profile rather than asserted once in a design document, so the
+    claim is auditable against the object that was produced: a profile built from
+    the BLS occupation table says NONE because no model ran, and a profile built
+    from a transcript by an LLM extractor says CREATOR because a model authored
+    the inputs the formulas then consumed.
+
+    The standing project rule is that models create and classify text while
+    deterministic code computes and validates numbers (SCOPE.md §2.6). CREATOR
+    names the model's half of that split — it authors the structured facts — and
+    is never a claim that a model chose a portfolio weight.
+    """
+    CREATOR = "creator"  # a model authored the structured inputs; math validated them
+    NONE    = "none"     # no model involved — BLS table or deterministic rule-based intake
 
 class HumanCapitalType(str, Enum):
     """
@@ -498,7 +608,16 @@ class ProfileAgentOutput(BaseModel):
     )
 
     # ── Career context ────────────────────────────────────────────────
-    industry_exposure_sector: str = Field(description="GICS-aligned sector of client's employer")
+    industry_exposure_sector: str = Field(
+        description=(
+            "GICS sector of the client's employer, or one of "
+            "NON_INVESTABLE_EMPLOYER_SECTORS when no listed sector tracks it. "
+            "Normalised to the canonical GICS spelling on construction — see "
+            "normalize_sector(). Downstream code matches this by string equality "
+            "against ETF sector labels, so the spelling is load-bearing: it selects "
+            "the employer proxy ETF and keys the employer sector cap."
+        )
+    )
     RSU_concentration:        float = Field(ge=0, le=1, description="Fraction of financial holdings in employer RSUs")
     has_pension:              bool  = False
     bonus_rate:               float = Field(
@@ -517,6 +636,20 @@ class ProfileAgentOutput(BaseModel):
     liquidity_needs:          LiquidityNeeds
     investment_objective:     InvestmentObjective
 
+    # ── Provenance ────────────────────────────────────────────────────
+    llm_role: LLMRole = Field(
+        default=LLMRole.NONE,
+        description=(
+            "What the language model did in producing THIS profile. CREATOR when a "
+            "model authored the structured facts (the transcript intake path via an "
+            "LLM extractor); NONE when the profile came from the BLS occupation table "
+            "or the deterministic rule-based extractor, where no model ran at all. "
+            "Every number in the profile is computed by the formulas in "
+            "agents/profile/profile_model.py regardless of this value — the flag "
+            "records who supplied the inputs, never who computed the outputs."
+        ),
+    )
+
     # ── Client mandates (folded in from the intake layer) ─────────────
     client_statements: list[ClientStatement] = Field(
         default_factory=list,
@@ -531,6 +664,28 @@ class ProfileAgentOutput(BaseModel):
     )
 
     # ── Validators ────────────────────────────────────────────────────
+
+    @field_validator("industry_exposure_sector")
+    @classmethod
+    def _canonical_sector(cls, v: str) -> str:
+        """
+        Normalise the employer sector to the canonical GICS spelling.
+
+        Normalisation happens here rather than at every call site because the
+        consequence of a near-miss is silent: agents/allocation/adapters.py looks
+        the sector up in ETF_SECTORS and _SECTOR_PROXY_ETF by exact string, and a
+        miss falls through to SPY and to the generic 20% sector limit without
+        raising. "Technology" instead of "Information Technology" therefore costs
+        an RSU-heavy client their 10% employer sector cap and gives them a
+        broad-market hedge proxy in place of a tech one.
+
+        Unrecognised sectors pass through rather than raising — a sector this map
+        has not seen is a mapping gap to fix, not a reason to refuse to build a
+        client's profile — but they will not be investable, so
+        check_sector_overlap() reports them as unmapped instead of silently
+        passing.
+        """
+        return normalize_sector(v)
 
     @model_validator(mode="after")
     def _check_holdings_sum(self) -> "ProfileAgentOutput":
@@ -742,25 +897,31 @@ class MacroRegimeSnapshot(BaseModel):
 
     # ── Raw FRED signals — DEPRECATED, pending removal ────────────────
     # The 24 Jul minutes ask this contract to "expose only the fields needed for
-    # allocation (label, confidence, volatility)". These six are consumed by
-    # NOTHING outside the Research Agent — verified by grep across agents/risk,
-    # agents/allocation, agents/compliance and agents/orchestrator — so they are
-    # dead weight on a public contract and a schema-drift risk.
+    # allocation (label, confidence, volatility)"; the 4 Aug minutes repeat it as
+    # Research item 5. These six are consumed by NOTHING outside the Research
+    # Agent — verified by grep across agents/risk, agents/allocation,
+    # agents/compliance and agents/orchestrator — so they are dead weight on a
+    # public contract and a schema-drift risk.
     #
     # They are deprecated rather than deleted because tests/test_research.py and
     # tests/test_compliance.py construct snapshots with them (5-6 references
-    # each), and tests/ is outside the Profile/Research edit scope. Removal is a
-    # one-line change per field once those fixtures can be updated; until then,
-    # use for_allocation() to get the intended minimal view.
+    # each), and tests/ is outside the Profile/Research edit scope.
+    #
+    # As of 4 Aug they are OPTIONAL. That is the half of the removal that can be
+    # done unilaterally: new code — including build_snapshot() — no longer passes
+    # them, so nothing further can come to depend on them, while the existing test
+    # fixtures that do pass them keep working unchanged. Deleting the six lines
+    # outright is then a mechanical change for whoever owns tests/, with no
+    # production caller left to update.
     #
     # The full signal matrix remains available in RegimeRecord and in
     # data/outputs/fred_macro_regimes.csv, so nothing is lost by dropping them.
-    yield_curve:   float = Field(description="DEPRECATED — 10Y minus 2Y Treasury spread, pct points (T10Y2Y)")
-    term_spread:   float = Field(description="DEPRECATED — 10Y minus 3M Treasury spread, pct points (T10Y3M)")
-    fed_funds:     float = Field(description="DEPRECATED — Effective Federal Funds Rate, pct (FEDFUNDS)")
-    unemployment:  float = Field(ge=0, description="DEPRECATED — Civilian Unemployment Rate, pct (UNRATE)")
-    cpi:           float = Field(description="DEPRECATED — CPI YoY % change, derived from CPIAUCSL")
-    credit_spread: float = Field(ge=0, description="DEPRECATED — Baa minus 10Y Treasury, pct points (BAA10Y)")
+    yield_curve:   Optional[float] = Field(default=None, deprecated=True, description="DEPRECATED — 10Y minus 2Y Treasury spread, pct points (T10Y2Y)")
+    term_spread:   Optional[float] = Field(default=None, deprecated=True, description="DEPRECATED — 10Y minus 3M Treasury spread, pct points (T10Y3M)")
+    fed_funds:     Optional[float] = Field(default=None, deprecated=True, description="DEPRECATED — Effective Federal Funds Rate, pct (FEDFUNDS)")
+    unemployment:  Optional[float] = Field(default=None, ge=0, deprecated=True, description="DEPRECATED — Civilian Unemployment Rate, pct (UNRATE)")
+    cpi:           Optional[float] = Field(default=None, deprecated=True, description="DEPRECATED — CPI YoY % change, derived from CPIAUCSL")
+    credit_spread: Optional[float] = Field(default=None, ge=0, deprecated=True, description="DEPRECATED — Baa minus 10Y Treasury, pct points (BAA10Y)")
 
     # ── Derived flags (set automatically by validator) ────────────────
     is_low_confidence:      bool = Field(default=False, description="True when regime_confidence < 0.60")
@@ -777,6 +938,18 @@ class MacroRegimeSnapshot(BaseModel):
             "the snapshot is built without the regime sequence and PELT breaks in hand."
         ),
     )
+
+    DEPRECATED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "yield_curve", "term_spread", "fed_funds", "unemployment", "cpi", "credit_spread",
+    })
+    """
+    The six raw FRED signals above, named so serialisers can drop them.
+
+    Pass as `exclude=` when writing a snapshot to disk — otherwise they serialise
+    as explicit nulls, which is a worse artifact than the numbers were: a reader
+    cannot tell a field that was deliberately retired from one whose computation
+    failed. See agents/research/research_agent._save_outputs.
+    """
 
     def for_allocation(self) -> dict:
         """

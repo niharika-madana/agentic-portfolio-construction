@@ -56,6 +56,7 @@ from contracts import (
     ClientStatement,
     ExtractedProfile,
     FactSource,
+    LLMRole,
     PipelineDestination,
     ProfileAgentOutput,
 )
@@ -436,6 +437,25 @@ def to_persona(extracted: ExtractedProfile) -> tuple[dict | None, BridgeResult]:
     return persona, result
 
 
+def _llm_role_for(extractor_name: str) -> LLMRole:
+    """
+    Which LLMRole the profile should record, given the extractor that produced it.
+
+    Resolved from the extractor class's own `uses_llm` declaration rather than a
+    string match on the name, so an extractor added later reports itself correctly
+    without anyone remembering to update this function. An unrecognised name is
+    reported as CREATOR: an extractor this module has never heard of is more
+    likely a new model-backed one than a new deterministic one, and over-reporting
+    model involvement is the safe direction to be wrong in for an audit trail.
+    """
+    from agents.profile import intake
+
+    for obj in vars(intake).values():
+        if isinstance(obj, type) and getattr(obj, "name", None) == extractor_name:
+            return LLMRole.CREATOR if getattr(obj, "uses_llm", True) else LLMRole.NONE
+    return LLMRole.CREATOR
+
+
 def build_profile_from_intake(
     extracted: ExtractedProfile, discount_rate: float
 ) -> BridgeResult:
@@ -444,6 +464,9 @@ def build_profile_from_intake(
 
     Every number in the returned profile is computed by build_profile() from the
     extracted inputs. The extractor supplies facts; the formulas supply figures.
+    That split is recorded on the profile itself as `llm_role`, so a reader of the
+    output can tell whether a model authored its inputs without knowing which
+    extractor was passed in.
     """
     persona, result = to_persona(extracted)
 
@@ -462,7 +485,10 @@ def build_profile_from_intake(
         return result
 
     profile_dict = build_profile(
-        persona, discount_rate, overrides=_sigma_override(extracted, result)
+        persona,
+        discount_rate,
+        overrides = _sigma_override(extracted, result),
+        llm_role  = _llm_role_for(extracted.extractor),
     )
     result.profile = to_profile_agent_output(profile_dict)
     return result
