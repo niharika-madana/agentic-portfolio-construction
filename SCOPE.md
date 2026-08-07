@@ -36,7 +36,7 @@ This project builds an agentic AI system that incorporates Human Capital into po
 | **Profile Agent** | HC valuation (BLS OES + SCF + FRED), income β/ρ/σ, equity target | James Huang |
 | **Research Agent** | Macro regime classification (PELT + KMeans + XGBoost), 13 FRED series | James Huang |
 | **Allocation Agent** | Black-Litterman portfolio construction, HC-adjusted weights, LLM rationale | Aidan Altorelli |
-| **Risk Agent** | Regime stress tests, position/sector limits, HC-correlation adjustment | Teammate |
+| **Risk Agent** | Regime stress tests, position/sector limits, HC-correlation adjustment | Aidan Altorelli |
 | **Compliance Agent** | Constraint set audit (Job 1), fiduciary content checks (Job 2) | Nihar |
 | **Orchestrator** | Pipeline sequencing, dual feedback loops, AdvisorPackage assembly | Nihar |
 
