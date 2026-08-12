@@ -5,12 +5,23 @@
   "regime_shift_date": "2023-08-01",
   "regime_confidence": 0.902,
   "regime_volatility": 0.0549,
-  "yield_curve": 0.71,
-  "term_spread": 0.51,
-  "fed_funds": 3.72,
-  "unemployment": 4.4,
-  "cpi": 2.6533,
-  "credit_spread": 1.72,
   "is_low_confidence": false,
-  "regime_change_detected": false
+  "regime_change_detected": false,
+  "regime_change_evidence": {
+    "months_in_regime": 29,
+    "min_dwell_months": 3,
+    "run_confidence": 0.8408,
+    "pelt_corroborated": false,
+    "months_to_nearest_break": 32,
+    "historical_reversion_rate": 0.75,
+    "transition_sample_size": 0,
+    "gates_passed": [
+      "persistence",
+      "confidence"
+    ],
+    "gates_failed": [
+      "structural_break",
+      "reversion_base_rate"
+    ]
+  }
 }

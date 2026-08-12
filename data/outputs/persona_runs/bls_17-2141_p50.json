@@ -1,0 +1,123 @@
+{
+  "client_id": "bls_17-2141_p50",
+  "career_type": "Engineering",
+  "age": 41,
+  "profile": {
+    "financial_capital": 90000.0,
+    "human_capital": 1579024.85,
+    "hc_over_fc": 17.544720555555557,
+    "hc_pct_of_total": 94.6,
+    "income_sigma": 0.2,
+    "income_corr": 0.4,
+    "income_beta": 0.5092,
+    "hc_type": "mixed",
+    "income_stability": "medium",
+    "implicit_equity_exposure": 0.482,
+    "effective_risk_budget": 0.811,
+    "portfolio_equity_target": 0.329,
+    "employer_sector": "Industrials",
+    "risk_tolerance": "moderate",
+    "objective": "growth",
+    "horizon_years": 24,
+    "rsu_concentration": 0.0,
+    "has_pension": false
+  },
+  "allocation": {
+    "n_funded": 26,
+    "n_universe": 26,
+    "top_holdings": [
+      [
+        "AMZN",
+        0.10010010010010006
+      ],
+      [
+        "NVDA",
+        0.10010010010010006
+      ],
+      [
+        "GOOGL",
+        0.10010010010010006
+      ],
+      [
+        "AAPL",
+        0.10010010010010006
+      ],
+      [
+        "TSLA",
+        0.06506506506506504
+      ],
+      [
+        "COST",
+        0.06206206206206204
+      ],
+      [
+        "BRK",
+        0.057057057057057034
+      ],
+      [
+        "META",
+        0.05505505505505503
+      ]
+    ],
+    "sector_weights": {
+      "Information Technology": 0.20020020020020013,
+      "Communication Services": 0.18118118118118112,
+      "Consumer Discretionary": 0.1741741741741741,
+      "Consumer Staples": 0.12912912912912908,
+      "Financials": 0.11811811811811808,
+      "Health Care": 0.05205205205205203,
+      "Real Estate": 0.040040040040040026,
+      "Energy": 0.033033033033033024,
+      "Industrials": 0.033033033033033024,
+      "Materials": 0.02902902902902902,
+      "Fixed Income": 0.010010010010010006
+    },
+    "employer_sector_weight": 0.033033033033033024,
+    "unique_rationales": 26,
+    "n_rationales": 26
+  },
+  "risk": {
+    "decision": "APPROVE",
+    "revisions": 0,
+    "vol_annual": 0.057660877103711344,
+    "market_regime": "normal",
+    "position_limits_passed": 38,
+    "position_limits_total": 38,
+    "sector_limits_passed": 13,
+    "sector_limits_total": 13,
+    "regimes_passed": 5,
+    "regimes_total": 5,
+    "violations": [],
+    "derivation": {
+      "drawdown_method": "benchmark_relative_per_regime",
+      "concentration_method": "marginal_risk_contribution",
+      "sector_method": "hc_correlation_adjusted"
+    }
+  },
+  "compliance": {
+    "status": "PASS",
+    "clearance": true,
+    "overall_severity": "NONE",
+    "revisions": 0,
+    "passed_total": 20,
+    "jobs": {
+      "job1": {
+        "passed": 9,
+        "violations": 0
+      },
+      "job2": {
+        "passed": 7,
+        "violations": 0
+      },
+      "job3": {
+        "passed": 4,
+        "violations": 0
+      }
+    },
+    "violations": [],
+    "routed_to": {}
+  },
+  "warnings": [
+    "Regime tilt not applied (no_change): No regime change: Late-Cycle Expansion has held for 29 months. No rebalance evaluated."
+  ]
+}

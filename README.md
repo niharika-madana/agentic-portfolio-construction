@@ -1,39 +1,39 @@
 # Agentic Portfolio Construction
 
-A five-agent AI system that constructs personalized investment portfolios grounded in Human Capital theory, macro regime detection, and regulatory compliance. Built for the Fordham MSQF Capstone 2026.
+A five-agent system that builds personalised portfolios from Human Capital theory, macro
+regime detection, and fiduciary compliance. Fordham MSQF Capstone 2026.
 
 ---
 
-## Core Idea
+## Core idea
 
-A client's total wealth = Financial Capital + Human Capital (PV of future earnings). The portfolio's equity allocation must account for how much equity risk the client already carries implicitly through their career. A software developer with RSUs correlated to the S&P 500 needs a very different portfolio than a tenured biology professor.
+Total wealth = Financial Capital + Human Capital (PV of future earnings). A portfolio's equity budget must be set **net of the equity risk the client already carries through their career**. A software engineer paid in RSUs and a tenured biology professor have opposite problems, and the same portfolio cannot be right for both.
 
 ```
-implicit_equity_exposure = HC_share × β
+implicit_equity_exposure = hc_share × β
 effective_risk_budget    = (FC + HC × (1 − σ)) / total_wealth
 portfolio_equity_target  = effective_risk_budget − implicit_equity_exposure
 ```
+
+`portfolio_equity_target` can go **negative**, the career alone already exceeds the total risk budget, and the correct portfolio holds no equity at all.
 
 ---
 
 ## Pipeline
 
 ```
-Profile Agent ──┐
-                ├──► Allocation Agent ◄──── FLAG (≤3 revisions)
-Research Agent ─┘         │                       │
-                           ▼                      │
-                       Risk Agent ─── FLAG ───────┘
-                           │
-                           ▼
-                    Compliance Agent ◄──── FAIL (≤2 revisions)
-                           │
-                           ▼
-                      AdvisorPackage
+Profile ──┐
+          ├─► Allocation ◄──► Risk        Loop A  (FLAG,  ≤3 revisions)
+Research ─┘        │
+                   ▼
+              Compliance                  Loop B  (FAIL,  ≤2 revisions)
+                   │
+                   ▼
+             AdvisorPackage
 ```
 
-| Agent | Entry Point | Output |
-|-------|------------|--------|
+| Agent | Entry point | Output |
+|---|---|---|
 | Profile | `agents/profile/profile_agent.py → run_profile_agent()` | `ProfileAgentOutput` |
 | Research | `agents/research/research_agent.py → run_research_agent()` | `MacroRegimeSnapshot` |
 | Allocation | `agents/allocation/agent.py → run_allocation_agent()` | `AllocationAgentOutput` |
@@ -41,48 +41,93 @@ Research Agent ─┘         │                       │
 | Compliance | `agents/compliance/compliance_agent.py → run_compliance()` | `ComplianceAgentOutput` |
 | Orchestrator | `agents/orchestrator/orchestrator_agent.py → run_pipeline()` | `AdvisorPackage` |
 
-All inter-agent schemas are defined in `contracts.py` (Pydantic v2).
+`contracts.py` is the single Pydantic v2 source of truth for every inter-agent schema with 18 enums, 40 models, 14 validators. Validators encode business rules, not just types.
+
+**Division of labour.** Language models extract, classify and narrate; deterministic code computes and validates. The Allocation Agent's LLM proposes the risky-sleeve composition and `agents/allocation/validator.py` re-checks it against the same hard bounds the optimizer enforces. `risky_weight` i.e., how much of financial wealth is risky at all, stays fully deterministic, because that number *is* the human-capital thesis.
 
 ---
 
-## Human Capital Parameters
+## Human capital calibration
 
-| Income Stability | σ | HC Type | β | ρ |
-|---|---|---|---|---|
-| High (academia, government, nursing) | 0.05 | bond-like | 0.05 | 0.10 |
-| Medium (legal, engineering, finance) | 0.20 | mixed | 0.35 | 0.40 |
-| Low (tech RSU, sales, commissions) | 0.40 | equity-like | 0.90 | 0.75 |
+| Income stability | σ | ρ | HC type | β |
+|---|---:|---:|---|---:|
+| High — academia, government, nursing | 0.05 | 0.10 | bond-like | 0.0318 |
+| Medium — legal, engineering, finance | 0.20 | 0.40 | mixed | 0.5092 |
+| Low — tech RSU, sales, commission | 0.40 | 0.75 | equity-like | 1.9096 |
 
-β and ρ from Ibbotson, Milevsky, Chen & Zhu (2007) and Davis & Willen (2000).
+β is **derived, not looked up**: `β = ρ × σ_income / σ_market`, against a single measured `SIGMA_MARKET = 0.1571` (annualised Fama-French `mktrf`, 312 months, 2000–2025). One model, one market. `ProfileAgentOutput.implied_market_volatility` inverts the identity as an audit, it must round-trip to ≈0.157 for every profile, whatever the HC type.
 
-**Nine target occupations (BLS p50):**
+Sources: Ibbotson, Milevsky, Chen & Zhu (2007); Davis & Willen (2000).
 
-| SOC | Label | HC Type | Portfolio Equity Target |
-|---|---|---|---|
-| 25-1042 | Biology Professor | bond-like | ~+92% |
-| 29-1141 | Registered Nurse | bond-like | ~+88% |
-| 13-1041 | Compliance Officer | bond-like | ~+85% |
-| 23-1011 | Lawyer | mixed | ~+60% |
-| 17-2141 | Mechanical Engineer | mixed | ~+55% |
-| 13-2051 | Financial Analyst | mixed | ~+48% |
-| 15-1252 | Software Developer | equity-like | ~−24% |
-| 11-3021 | IT Manager | equity-like | ~−18% |
-| 11-2022 | Sales Manager | equity-like | ~−10% |
+---
+
+## Results — nine BLS personas
+
+Measured end-to-end, one `run_pipeline` per persona (`data/outputs/persona_runs/`).
+
+| SOC | Occupation | HC type | β | Equity target | Portfolio vol | Compliance |
+|---|---|---|---:|---:|---:|---|
+| 25-1042 | Biology Professor | bond-like | 0.03 | +0.931 | 7.51% | PASS |
+| 29-1141 | Registered Nurse | bond-like | 0.03 | +0.923 | 7.52% | PASS |
+| 13-1041 | Compliance Officer | bond-like | 0.03 | +0.924 | 7.51% | PASS_WITH_WARNINGS |
+| 23-1011 | Lawyer | mixed | 0.51 | +0.354 | 6.20% | PASS |
+| 17-2141 | Mechanical Engineer | mixed | 0.51 | +0.329 | 5.77% | PASS |
+| 13-2051 | Financial Analyst | mixed | 0.51 | +0.327 | 5.73% | PASS |
+| 15-1252 | Software Developer | equity-like | 1.91 | −1.223 | 0.00% | PASS_WITH_WARNINGS |
+| 11-3021 | IT Manager | equity-like | 1.91 | −1.230 | 0.00% | PASS_WITH_WARNINGS |
+| 11-2022 | Sales Manager | equity-like | 1.91 | −1.208 | 0.00% | PASS_WITH_WARNINGS |
+
+**Portfolio vol falls monotonically as career equity risk rises**: 7.5% → 5.8% → 0.00%.
+The three equity-like personas receive a fully defensive portfolio: their careers already consume the entire risk budget. All nine cleared compliance (9/9 `APPROVE`, 9/9 clearance).
+
+---
+
+## Asset universe
+
+**33 single stocks** (three largest by market cap in each of the 11 GICS sectors) and **5 defensive funds**(`TLT`, `SHY`, `TIP`, `LQD`, `GLD`). Single names are used because an ETF universe cannot enforce its own concentration limits.
+
+`AGG` and `BIL` are deliberately absent: `AGG` duplicates the treasury and credit funds beside it, and `BIL` (0.6% annualised vol) *is* the risk-free asset that `safe_weight = 1 − w_fin` already represents.
+
+| Limit | Value |
+|---|---:|
+| Single name | 10% |
+| Sector | 20% |
+| Employer's sector | 10% |
+| Employer's own stock | 0% |
+
+Because single names carry real GICS sectors, the employer-sector cap binds (9.82% and 10.01% in the runs above).
+
+> **Estimation caveat.** `build_returns_matrix` ends in `pivot.dropna()`, so the covariance sample is the *intersection* of every ticker's history. The current universe yields **151 months × 38 assets (T/N ≈ 4.0)**, bounded by META's 2012 listing. Adequate, not comfortable — dropping the three post-2008 listings would extend it to 2005.
+
+---
+
+## Compliance Agent
+
+Three jobs, 13 check functions, 20 named checks. **Every decision is deterministic** and the
+LLM never sets a pass/fail.
+
+| Job | File | Covers |
+|---|---|---|
+| 1 | `constraint_checks.py` | Audits the **Risk Agent's** output: completeness, actual-vs-limit-vs-flag consistency, derivation-method audit |
+| 2 | `content_checks.py` | Fiduciary content (Reg BI, FINRA 2111): rationale completeness, specificity, HC acknowledgment, weight integrity, volatility suitability, **rationale distinctness** |
+| 3 | `job3_robo_adviser_checks.py` | Robo-adviser duties (SEC IM 2017-02): composition↔objective, client-mandate consistency, algorithm-limitation disclosure, ETF-provider conflict |
+
+`report.py` applies the severity ladder — any `HIGH` → `FAIL` and no clearance; `MEDIUM`/`LOW` → `PASS_WITH_WARNINGS` — and groups violations by responsible agent into `agent_feedback`, which is the routing table Loop B consumes.
 
 ---
 
 ## Setup
 
-### 1. Install
-
 ```bash
 git clone https://github.com/niharika-madana/agentic-portfolio-construction.git
 cd agentic-portfolio-construction
-python -m venv .venv && .venv\Scripts\activate   # Windows
+python -m venv .venv && .venv\Scripts\activate      # Windows
 pip install -e .
 ```
 
-### 2. Populate data cache (one-time, ~10 min, requires WRDS access)
+Create `.env` with `FRED_API_KEY` and `ANTHROPIC_API_KEY`.
+
+**Populate the cache** (one-time, ~10 min, needs WRDS credentials):
 
 ```python
 from data.fetch.wrds import get_connection, fetch_crsp_monthly, fetch_crsp_daily, fetch_ff_factors
@@ -91,112 +136,80 @@ from data.fetch.bls import fetch_bls_oes
 from data.fetch.factors import fetch_ff12
 from agents.allocation.adapters import DEFAULT_TICKERS
 
-conn = get_connection()                         # prompts for WRDS credentials
-fetch_crsp_monthly(DEFAULT_TICKERS, conn=conn)  # + permno_map + mkt_cap_weights
-fetch_crsp_daily(DEFAULT_TICKERS, conn=conn)
+conn = get_connection()                                      # prompts for WRDS credentials
+fetch_crsp_monthly(DEFAULT_TICKERS, conn=conn, force=True)   # + permno_map + mkt_cap_weights
+fetch_crsp_daily(DEFAULT_TICKERS,  conn=conn, force=True)
 fetch_ff_factors(conn=conn)
-fetch_fred_macro(fred_api_key="YOUR_FRED_KEY")
+fetch_fred_macro(fred_api_key="...")
 fetch_bls_oes()
 fetch_ff12()
 ```
 
-Data is cached as parquet in `data/storage/` (data also pushed for reference).
+`force=True` is required when a cache already exists, the fetchers short-circuit otherwise,
+which silently leaves an older universe in place.
 
-### 3. Run the pipeline
+**Run:**
 
 ```python
 from agents.profile.profile_agent import run_profile_agent
 from agents.research.research_agent import run_research_agent
 from agents.orchestrator.orchestrator_agent import run_pipeline
 
-profiles = run_profile_agent()
+profiles = run_profile_agent(save=False)
 macro    = run_research_agent()
-package  = run_pipeline(profiles[0], macro, fred_api_key="YOUR_FRED_KEY")
+package  = run_pipeline(profiles[0], macro)
 ```
 
-Or open `pipeline_demo.ipynb` for a guided walkthrough.
+Or open `pipeline_demo.ipynb` — environment → data → Profile → Research → both loops → full
+`AdvisorPackage`.
 
-### 4. Run tests
-
-```bash
-pytest tests/ -v
-```
+**Test:** `pytest tests/ agents/ -q`
 
 ---
 
-## File Structure
+## Layout
 
 ```
-contracts.py                        ← Pydantic v2 inter-agent schemas
-pipeline_demo.ipynb                 ← End-to-end demo notebook
-pyproject.toml                      ← Dependencies + pytest config
-│
+contracts.py                     Pydantic v2 inter-agent schemas — the single source of truth
+pipeline_demo.ipynb              End-to-end walkthrough
+
 data/
-├── fetch/                          ← One-time data fetchers (FRED, BLS, WRDS, FF)
-├── storage/                        ← Parquet cache (gitignored)
-└── outputs/                        ← JSON/CSV pipeline outputs
-│
-agents/
-├── shared/core/
-│   ├── allocation.py               ← Black-Litterman optimizer
-│   ├── risk.py                     ← VaR, drawdown, stress tests
-│   ├── constraints.py              ← Limit constants + helpers
-│   └── human_capital.py            ← BMS 1992 w_fin, Merton risky share
-│
-├── profile/
-│   ├── profile_agent.py            ← run_profile_agent()
-│   └── profile_model.py            ← HC valuation, β table, persona builder
-│
-├── research/
-│   ├── research_agent.py           ← run_research_agent()
-│   ├── pipeline.py                 ← PELT → KMeans → XGBoost → smoothing
-│   └── adapters.py                 ← MacroRegimeSnapshot builder
-│
-├── allocation/
-│   ├── agent.py                    ← run_allocation_agent()
-│   └── adapters.py                 ← ProfileAgentOutput → AllocationInput
-│
-├── risk/
-│   └── agent.py                    ← run_risk_agent()
-│
-├── compliance/
-│   ├── compliance_agent.py         ← run_compliance()
-│   ├── constraint_checks.py        ← Job 1: audit Risk Agent (checks 1.1–1.3)
-│   ├── content_checks.py           ← Job 2: fiduciary checks (checks 2.1–2.5)
-│   └── report.py                   ← ComplianceAgentOutput assembler
-│
-└── orchestrator/
-    └── orchestrator_agent.py       ← run_pipeline(), dual feedback loops
-│
-tests/
-├── test_compliance.py
-├── test_profile.py
-├── test_research.py
-├── test_allocation_core.py
-├── test_human_capital.py
-└── test_constraints.py
+├── fetch/                       WRDS/CRSP, FRED, BLS, Fama-French fetchers
+├── storage/                     Parquet cache
+└── outputs/                     Regime snapshot, profiles, per-persona pipeline runs
+
+agents/shared/core/
+├── allocation.py                Black-Litterman + Merton/HC risky-weight solve
+├── risk.py                      VaR, drawdown, stress tests
+├── constraints.py               Limit constants + breach checks
+└── human_capital.py             BMS 1992 w_fin, Merton risky share
+
+agents/profile/                  profile_agent · profile_model · sector_guard
+                                 intake · intake_bridge · intake_eval · transcript_generator
+agents/research/                 research_agent · pipeline (PELT→KMeans→XGBoost)
+                                 rebalance · regime_returns · regime_sleeves · adapters
+agents/allocation/               agent · adapters · validator
+agents/risk/                     agent
+agents/compliance/               compliance_agent · constraint_checks · content_checks
+                                 job3_robo_adviser_checks · report
+agents/orchestrator/             orchestrator_agent — control plane, both feedback loops
+
+tests/                           compliance · job3 · profile · research · allocation_core
+                                 human_capital · constraints · intake_weld
 ```
 
 ---
 
 ## References
 
-**Human Capital**
-- Ibbotson, Milevsky, Chen & Zhu (2007). *Lifetime Financial Advice.* CFA Institute Research Foundation.
-- Davis & Willen (2000). *Using Financial Assets to Hedge Labor Income Risks.* SSRN.
-- Bodie, Merton & Samuelson (1992). *Labor Supply Flexibility and Portfolio Choice.* JEDC.
-- Campbell & Viceira (2002). *Strategic Asset Allocation.* Oxford University Press.
+**Human capital** — Ibbotson, Milevsky, Chen & Zhu (2007), *Lifetime Financial Advice*;
+Davis & Willen (2000); Bodie, Merton & Samuelson (1992); Campbell & Viceira (2002).
 
-**Regime Detection**
-- Hamilton (1989). *A New Approach to Nonstationary Time Series and the Business Cycle.* Econometrica.
-- Clarida, Galí & Gertler (1999). *The Science of Monetary Policy.* JEL.
+**Regime detection** — Hamilton (1989); Clarida, Galí & Gertler (1999); Killick, Fearnhead &
+Eckley (2012), *PELT*.
 
-**Portfolio Optimisation**
-- Black & Litterman (1992). *Global Portfolio Optimization.* Financial Analysts Journal.
-- Sharpe (1964). *Capital Asset Prices.* Journal of Finance.
+**Optimisation** — Black & Litterman (1992); Merton (1971); Sharpe (1964).
 
-**Regulatory**
-- FINRA Rule 2111 — Suitability
-- SEC Regulation Best Interest (Reg BI), 17 CFR 240.15l-1
-- FINRA Rule 2090 — Know Your Customer
-- Uniform Prudent Investor Act
+**Regulatory** — SEC Regulation Best Interest, 17 CFR 240.15l-1; SEC IM Guidance Update
+2017-02 (Robo-Advisers); Investment Advisers Act of 1940; FINRA Rules 2111 and 2090;
+Uniform Prudent Investor Act.

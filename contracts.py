@@ -46,17 +46,8 @@ GICS_SECTORS: frozenset[str] = frozenset({
     "Utilities",
 })
 """
-The eleven GICS sectors, spelled exactly as the Allocation Agent's ETF sector
-map spells them.
-
-This is a shared vocabulary, not a Profile Agent detail. `industry_exposure_sector`
-is matched by STRING EQUALITY on the allocation and risk side — an employer sector
-of "Technology" does not match the ETF sector "Information Technology", so the
-employer sector cap silently degrades to the generic sector limit and the employer
-proxy ETF silently degrades to SPY. Both failures are invisible: no exception, no
-warning, just a portfolio that was never actually constrained.
-
-Keep this set and `agents/allocation/adapters.ETF_SECTORS` in agreement.
+- Eleven GICS sectors matching `agents/allocation/adapters.ETF_SECTORS` exactly.
+- Uses strict string equality across agents; misspellings (e.g., "Technology" vs. "Information Technology") cause silent fallback failures without throwing errors.
 """
 
 NON_INVESTABLE_EMPLOYER_SECTORS: frozenset[str] = frozenset({
@@ -66,12 +57,8 @@ NON_INVESTABLE_EMPLOYER_SECTORS: frozenset[str] = frozenset({
     "Legal",
 })
 """
-Employer sectors with no GICS equivalent, because no listed sector ETF tracks them.
-
-These are legitimate values for `industry_exposure_sector` — a tenured professor's
-employer really is not in an investable sector — and the sector-overlap guard is a
-deliberate no-op for them. They are enumerated rather than allowed implicitly so
-that a genuine typo ("Techonlogy") is still distinguishable from an honest absence.
+- Non-GICS employer sectors that safely bypass sector-overlap limits.
+- Enumerated explicitly so legitimate non-investable sectors pass while typos still fail.
 """
 
 _SECTOR_ALIASES: dict[str, str] = {
@@ -98,18 +85,16 @@ _SECTOR_ALIASES: dict[str, str] = {
     "legal":              "Legal",
 }
 
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
 
 def normalize_sector(sector: str) -> str:
     """
-    Map an employer sector onto the canonical GICS spelling.
-
-    Case- and spacing-insensitive, so "technology", "Technology" and
-    "  TECHNOLOGY " all land on "Information Technology". Unrecognised values are
-    returned stripped but otherwise untouched: this normalises vocabulary, it does
-    not invent a classification for a sector nobody has mapped yet. Use
-    `is_investable_sector()` to tell whether the result can be matched against an
-    ETF sector map.
-    """
+    - Normalizes employer sectors to canonical GICS spelling (case/spacing-insensitive).
+    - Unrecognized values are returned cleaned; use `is_investable_sector()` to validate ETF mapping.
+"""
     if not isinstance(sector, str):
         return sector
     return _SECTOR_ALIASES.get(sector.strip().lower(), sector.strip())
@@ -126,21 +111,11 @@ def is_investable_sector(sector: str) -> bool:
 
 class LLMRole(str, Enum):
     """
-    What the language model actually did in producing a given profile.
-
-    Recorded per profile rather than asserted once in a design document, so the
-    claim is auditable against the object that was produced: a profile built from
-    the BLS occupation table says NONE because no model ran, and a profile built
-    from a transcript by an LLM extractor says CREATOR because a model authored
-    the inputs the formulas then consumed.
-
-    The standing project rule is that models create and classify text while
-    deterministic code computes and validates numbers (SCOPE.md §2.6). CREATOR
-    names the model's half of that split — it authors the structured facts — and
-    is never a claim that a model chose a portfolio weight.
+    - Auditable record of the LLM's role in producing a profile (e.g., NONE vs. CREATOR).
+    - Models author/classify text, while deterministic code handles numbers; CREATOR never implies portfolio weight selection.
     """
-    CREATOR = "creator"  # a model authored the structured inputs; math validated them
-    NONE    = "none"     # no model involved — BLS table or deterministic rule-based intake
+    CREATOR = "creator"  # a model authored the structured inputs; math validated
+    NONE    = "none"     # no model involved (BLS table or deterministic rule-based intake)
 
 class HumanCapitalType(str, Enum):
     """
@@ -228,7 +203,7 @@ class ConstraintType(str, Enum):
     ECONOMIC_SECTOR      = "economic_sector"
     EMPLOYER             = "employer"
     RISK_PROFILE_DOWNGRADE = "risk_profile_downgrade"  # AGGRESSIVE→MODERATE→CONSERVATIVE on critical stress
-    RISKY_WEIGHT_CAP     = "risky_weight_cap"  # direct cap on total risky weight, sized to the actual drawdown breach
+    RISKY_WEIGHT_CAP     = "risky_weight_cap"          # direct cap on total risky weight, sized to the actual drawdown breach
 
 
 class RiskProfile(str, Enum):
@@ -266,11 +241,8 @@ class ResponsibleAgent(str, Enum):
 
 class FactSource(str, Enum):
     """
-    Where a field's value came from. Kept distinct because merging them destroys
-    the one thing suitability review needs: which constraints the client actually
-    asserted, versus which the system decided on their behalf.
-
-    "I'm 47" is STATED. "Your horizon is 16 years" is INFERRED.
+    - Tracks data provenance to distinguish client-asserted facts (STATED) from system-calculated assumptions (INFERRED).
+    - Preserves the audit trail required for suitability reviews.
     """
     STATED   = "stated"    # the client said it; evidence_quote is mandatory
     INFERRED = "inferred"  # derived from something the client said
@@ -280,12 +252,8 @@ class FactSource(str, Enum):
 
 class ExtractedField(BaseModel):
     """
-    One field pulled from a client conversation, with its provenance.
-
-    For a fiduciary system, provenance is close to mandatory: you must be able to
-    show a client the sentence that produced a number in their recommendation.
-    The validators below make an unsourced STATED field, or a guessed UNKNOWN
-    field, impossible to construct rather than merely discouraged.
+    - Stores an extracted conversational field alongside its mandatory audit provenance.
+    - Validation rules strictly prevent constructing unsourced STATED or guessed UNKNOWN fields.
     """
 
     name:  str
@@ -348,41 +316,15 @@ class ExtractedField(BaseModel):
 
 class StatementKind(str, Enum):
     """
-    What kind of object a thing the client said actually is.
-
-    A discovery call does not yield one flat list of fields. It yields
-    statements of different kinds, and the system has to sort them before it can
-    act — a preference and a constraint look alike in prose and behave nothing
-    alike in an optimiser.
+    - Categorizes client statements to distinguish operational types (e.g., preferences vs. constraints).
+    - Ensures raw conversation turns are correctly routed before optimizer processing.
     """
-
     HARD_CONSTRAINT  = "hard_constraint"
-    """Something the client will not hold. Shrinks the feasible set, at a cost that can be measured and reported."""
-
     SOFT_PREFERENCE  = "soft_preference"
-    """A tilt the client would like reflected. Not a constraint — closer to a Black-Litterman view, and needs a bounded budget before it can be honoured."""
-
     RISK_FACT        = "risk_fact"
-    """
-    A fact that arrives dressed as a preference but is really an exposure.
-
-    Priya's ARVX holding is not a preference for her employer's stock; it is a
-    concentration, a human-capital beta, and a forced sector underweight — one
-    passage, three destinations. This is the category that makes sorting worth
-    doing at all.
-    """
-
     SUITABILITY_FACT = "suitability_fact"
-    """Horizon, liquidity, account type, and what is in or out of scope. Often stated once and never repeated."""
-
     CHALLENGE        = "challenge"
-    """
-    A contradiction worth putting back to the client — a stated risk tolerance
-    that disagrees with their actual exposure, or a self-description that
-    disagrees with their holdings. Recorded for advisor review; never acted on
-    automatically.
-    """
-
+    
 
 class PipelineDestination(str, Enum):
     """Where a classified statement is supposed to end up."""
@@ -399,12 +341,8 @@ class PipelineDestination(str, Enum):
 
 class ClientStatement(BaseModel):
     """
-    One classified thing the client said, with its provenance and destinations.
-
-    Distinct from ExtractedField: a field is a typed value the formulas consume,
-    a statement is a piece of the conversation that has to be routed. The same
-    sentence can produce both — Priya's ARVX line yields an `RSU_concentration`
-    field *and* a RISK_FACT statement bound for three destinations.
+    - A classified conversational statement mapped to its provenance and downstream routing destinations.
+    - Unlike ExtractedField (a typed formula input), a statement represents a conversational turn to be routed.
     """
 
     kind:    StatementKind
@@ -440,14 +378,9 @@ class ClientStatement(BaseModel):
 
 class ExtractedProfile(BaseModel):
     """
-    The typed output of the intake layer — the 'extract' half of the standing
-    rule that language models extract, classify and narrate while deterministic
-    code computes.
-
-    Nothing here is a portfolio number. This is what the client said, typed and
-    sourced; ProfileAgentOutput is what the deterministic formulas make of it.
+    - Typed intake layer output containing client-stated and sourced data (no computed portfolio values).
+    - Represents the extraction phase before deterministic formulas generate the ProfileAgentOutput.
     """
-
     client_id:      str
     transcript_id:  str = Field(description="Identifies the source conversation")
     extractor:      str = Field(description="Which extraction strategy produced this")
@@ -520,8 +453,7 @@ class ProfileAgentOutput(BaseModel):
                                      equity exposure is appropriate for the client's
                                      risk tolerance
 
-    Reference: Ibbotson, Milevsky, Chen, Zhu (2007) — "Lifetime Financial
-    Advice: Human Capital, Asset Allocation, and Insurance."
+    Reference: Ibbotson, Milevsky, Chen, Zhu (2007) "Lifetime Financial Advice: Human Capital, Asset Allocation, and Insurance."
     """
 
     # ── Identity ──────────────────────────────────────────────────────
@@ -669,21 +601,10 @@ class ProfileAgentOutput(BaseModel):
     @classmethod
     def _canonical_sector(cls, v: str) -> str:
         """
-        Normalise the employer sector to the canonical GICS spelling.
-
-        Normalisation happens here rather than at every call site because the
-        consequence of a near-miss is silent: agents/allocation/adapters.py looks
-        the sector up in ETF_SECTORS and _SECTOR_PROXY_ETF by exact string, and a
-        miss falls through to SPY and to the generic 20% sector limit without
-        raising. "Technology" instead of "Information Technology" therefore costs
-        an RSU-heavy client their 10% employer sector cap and gives them a
-        broad-market hedge proxy in place of a tech one.
-
-        Unrecognised sectors pass through rather than raising — a sector this map
-        has not seen is a mapping gap to fix, not a reason to refuse to build a
-        client's profile — but they will not be investable, so
-        check_sector_overlap() reports them as unmapped instead of silently
-        passing.
+        - Normalizes employer sectors to canonical GICS spelling to prevent silent lookup failures.
+        - Exact string matching in ETF_SECTORS prevents near-misses (e.g., "Technology" vs. "Information Technology") 
+          from defaulting to broad SPY hedges and generic caps. Unrecognized sectors pass through unmapped 
+          without raising, allowing profile generation while signaling non-investable status.
         """
         return normalize_sector(v)
 
@@ -742,16 +663,8 @@ class ProfileAgentOutput(BaseModel):
 
 class RegimeChangeEvidence(BaseModel):
     """
-    Persona-independent evidence that a detected regime change is structural
-    rather than classifier noise. Built by agents/research/rebalance.py from the
-    regime sequence, the PELT break dates, and the XGBoost confidence path.
-
-    Motivation: the 1995-2025 smoothed sequence contains 18 regime runs with a
-    median length of 5 months, and 10 of them last 6 months or less. Six label
-    flips occur between 2011-11 and 2013-10 alone. Rebalancing on
-    regime_change_detected would have traded the book on every one of them.
-
-    Every field is computed deterministically — no LLM involvement.
+    - Deterministic, persona-independent verification that a regime change is structural rather than noise.
+    - Evaluates PELT breaks and XGBoost confidence paths to prevent over-trading on short-lived label flips(e.g., 18 historical runs averaging 5 months, with 6 flips in 2011–2013 alone).
     """
 
     months_in_regime: int = Field(
