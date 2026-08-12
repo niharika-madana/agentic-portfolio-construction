@@ -22,45 +22,119 @@ from contracts import (
 # Static ETF universe configuration
 # ---------------------------------------------------------------------------
 
+# Three largest US-listed names per GICS sector, plus five non-overlapping
+# defensive funds.
+#
+# Replaces the previous 24-ETF universe, where SPY held the XL* sector ETFs'
+# constituents and AGG held TLT/IEF/SHY/LQD/TIP's. A 10% single-name limit on SPY
+# and 10% on XLK did not bound technology at 20% — it bounded it at 20% plus
+# whatever technology SPY already carried. The optimizer enforced a concentration
+# constraint it could not actually enforce, and nothing raised: weights summed to
+# 1.0 and every stated limit was respected on paper. Single stocks have no such
+# overlap; a share of AAPL is technology exposure exactly once.
+#
+# Sector assignment follows the March 2023 GICS reclassification, which moved the
+# payment networks (V, MA) from Information Technology to Financials.
+#
+# RTX, LIN and PLD are NOT here despite being top-three by market cap. Each gets a
+# fresh CRSP PERMNO at a merger (Raytheon/UTC 2020-04, Linde/Praxair 2018-10,
+# Prologis/AMB 2011-06), and build_returns_matrix() ends in pivot.dropna(), so the
+# covariance sample is the INTERSECTION of every ticker's history — one late
+# PERMNO truncates the window for all 38 assets. RTX alone would cut it to 2020.
+# They are replaced by the next-largest name in the same sector with continuous
+# history. The company is old in each case; only CRSP's PERMNO for the ticker is
+# new, which makes this the easiest trap in the file to walk into.
 DEFAULT_TICKERS: list[str] = [
-    # Broad equity
-    "SPY", "IWM", "EFA", "EEM",
-    # Fixed income
-    "AGG", "TLT", "IEF", "SHY", "HYG", "LQD", "TIP",
-    # Real assets — DJP excluded (ETN, not in CRSP)
-    "GLD", "VNQ",
-    # Sector ETFs
-    "XLK", "XLF", "XLV", "XLE", "XLI", "XLC", "XLY", "XLP", "XLU", "XLRE",
-    # Cash proxy
-    "BIL",
+    # Communication Services
+    "GOOGL", "META", "NFLX",
+    # Consumer Discretionary
+    "AMZN", "TSLA", "HD",
+    # Consumer Staples
+    "WMT", "COST", "PG",
+    # Energy
+    "XOM", "CVX", "COP",
+    # Financials
+    "BRK", "JPM", "V",
+    # Health Care
+    "LLY", "JNJ", "UNH",
+    # Industrials — HON replaces RTX (PERMNO restarts 2020-04)
+    "GE", "CAT", "HON",
+    # Information Technology
+    "NVDA", "MSFT", "AAPL",
+    # Materials — APD replaces LIN (PERMNO restarts 2018-10)
+    "SHW", "ECL", "APD",
+    # Real Estate — SPG replaces PLD (PERMNO restarts 2011-06)
+    "AMT", "WELL", "SPG",
+    # Utilities
+    "NEE", "SO", "DUK",
+    # Defensive sleeve — five distinct exposures, none containing another
+    "TLT", "SHY", "TIP", "LQD", "GLD",
 ]
 
-# ETFs are not classified in Compustat — this is the canonical sector source.
+# Canonical sector source. Single stocks carry their GICS sector; the five funds
+# keep the "Fixed Income" / "Real Assets" labels the previous universe used, so
+# the 20% SECTOR_LIMIT still caps total fixed income the way it did before.
+#
+# AGG, BIL, HYG and IEF are deliberately absent. AGG holds the same treasuries as
+# TLT/SHY/TIP and the same credit as LQD, so it double-counts every other fund
+# here. BIL is 0.60% annualised vol — it IS the risk-free asset, which
+# agents/shared/core/allocation.py already models as `safe_weight = 1 - w_fin`;
+# holding it inside the risky sleeve made the safety decision twice, once by
+# Black-Litterman (which knows nothing about human capital) and once by the
+# Merton/Campbell-Viceira w_fin (where this project's thesis lives). IEF is the
+# middle of the curve TLT and SHY already bracket, and HYG's credit risk is
+# equity-like — the equity sleeve carries it more directly.
 ETF_SECTORS: dict[str, str] = {
-    "SPY":  "Broad Market",
-    "IWM":  "Broad Market",
-    "EFA":  "Broad Market",
-    "EEM":  "Broad Market",
-    "AGG":  "Fixed Income",
-    "TLT":  "Fixed Income",
-    "IEF":  "Fixed Income",
-    "SHY":  "Fixed Income",
-    "HYG":  "Fixed Income",
-    "LQD":  "Fixed Income",
-    "TIP":  "Fixed Income",
-    "GLD":  "Real Assets",
-    "VNQ":  "Real Estate",
-    "XLK":  "Information Technology",
-    "XLF":  "Financials",
-    "XLV":  "Health Care",
-    "XLE":  "Energy",
-    "XLI":  "Industrials",
-    "XLC":  "Communication Services",
-    "XLY":  "Consumer Discretionary",
-    "XLP":  "Consumer Staples",
-    "XLU":  "Utilities",
-    "XLRE": "Real Estate",
-    "BIL":  "Cash",
+    # Communication Services
+    "GOOGL": "Communication Services",
+    "META":  "Communication Services",
+    "NFLX":  "Communication Services",
+    # Consumer Discretionary
+    "AMZN":  "Consumer Discretionary",
+    "TSLA":  "Consumer Discretionary",
+    "HD":    "Consumer Discretionary",
+    # Consumer Staples
+    "WMT":   "Consumer Staples",
+    "COST":  "Consumer Staples",
+    "PG":    "Consumer Staples",
+    # Energy
+    "XOM":   "Energy",
+    "CVX":   "Energy",
+    "COP":   "Energy",
+    # Financials
+    "BRK":   "Financials",
+    "JPM":   "Financials",
+    "V":     "Financials",
+    # Health Care
+    "LLY":   "Health Care",
+    "JNJ":   "Health Care",
+    "UNH":   "Health Care",
+    # Industrials
+    "GE":    "Industrials",
+    "CAT":   "Industrials",
+    "HON":   "Industrials",
+    # Information Technology
+    "NVDA":  "Information Technology",
+    "MSFT":  "Information Technology",
+    "AAPL":  "Information Technology",
+    # Materials
+    "SHW":   "Materials",
+    "ECL":   "Materials",
+    "APD":   "Materials",
+    # Real Estate
+    "AMT":   "Real Estate",
+    "WELL":  "Real Estate",
+    "SPG":   "Real Estate",
+    # Utilities
+    "NEE":   "Utilities",
+    "SO":    "Utilities",
+    "DUK":   "Utilities",
+    # Defensive sleeve
+    "TLT":   "Fixed Income",
+    "SHY":   "Fixed Income",
+    "TIP":   "Fixed Income",
+    "LQD":   "Fixed Income",
+    "GLD":   "Real Assets",
 }
 
 # Sector proxy ETF — used as employer_ticker when the employer is not publicly traded.
