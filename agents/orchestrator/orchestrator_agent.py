@@ -6,10 +6,15 @@ Entry point:
 
 Pipeline sequence:
   1. Pre-flight checks (low-confidence macro warning)
-  2. Allocation ↔ Risk loop (max 3 FLAG revisions)
-  3. Assemble ComplianceInput
-  4. Compliance ↔ Allocation/Risk loop (max 2 revisions)
-  5. Assemble AdvisorPackage
+  2. Discount rate, then the regime tilt on the client's equity target
+  3. Allocation ↔ Risk loop (max 3 FLAG revisions)
+  4. Assemble ComplianceInput
+  5. Compliance ↔ Allocation/Risk loop (max 2 revisions)
+  6. Assemble AdvisorPackage
+
+Step 2's tilt is the Research Agent's only route into the portfolio — see
+apply_regime_tilt(). Everywhere else macro reaches (the pre-flight warning, the
+compliance narrative, the final package) it is reported, not acted on.
 
 All quantitative decisions are deterministic. LLMs participate only in
 rationale, reasoning trace, and executive summary (3 touchpoints total).
@@ -20,6 +25,7 @@ from __future__ import annotations
 import logging
 import sys
 import os
+from pathlib import Path
 
 import pandas as pd
 
@@ -29,11 +35,14 @@ from contracts import (
     AdvisorPackage, AllocationAgentOutput, AllocationOutput,
     ClientProfileSection, ComplianceInput, ComplianceStatus,
     HumanCapitalSection, MacroRegimeSection, MacroRegimeSnapshot,
-    ProfileAgentOutput, RegimeChangeFlag, RiskAgentOutput, RiskDecision,
+    ProfileAgentOutput, RebalanceDecision, RebalanceEvaluation,
+    RegimeChangeFlag, RiskAgentOutput, RiskDecision,
     RiskOutput, RunMetadata,
 )
 from agents.allocation.agent import run_allocation_agent
 from agents.compliance.compliance_agent import run_compliance
+from agents.research.rebalance import evaluate_rebalance
+from agents.research.regime_returns import compute_regime_stats, regime_tilt
 from agents.risk.agent import run_risk_agent
 from data.fetch.fred import latest_dgs10
 from data.fetch.wrds import load_ff_factors
@@ -118,6 +127,120 @@ def _regime_volatility_label(v: float) -> str:
         return "high"
 
 
+# ---------------------------------------------------------------------------
+# Regime tilt — the Research Agent's only route into the portfolio
+# ---------------------------------------------------------------------------
+
+_REGIME_FEATURES_PARQUET = (
+    Path(__file__).resolve().parent.parent.parent / "data" / "storage" / "fred_macro_regimes.parquet"
+)
+"""
+The smoothed regime sequence, written by research_agent._save_outputs().
+
+MacroRegimeSnapshot carries a single month; compute_regime_stats() needs the full
+monthly label path to measure each regime's realised volatility. Loading it from
+the cache mirrors how this module already sources ff_factors, and keeps
+run_pipeline's signature unchanged.
+"""
+
+
+def _load_regime_stats() -> dict:
+    """
+    Per-regime equity tilts from the cached smoothed regime sequence.
+
+    Returns an empty dict when the cache is absent or malformed. That is not a
+    silent failure: evaluate_rebalance() treats an empty stats dict as
+    INSUFFICIENT_HISTORY rather than a zero tilt, so an unmeasured regime is
+    reported instead of being quietly acted on with a fabricated number.
+    """
+    if not _REGIME_FEATURES_PARQUET.exists():
+        return {}
+    try:
+        df = pd.read_parquet(_REGIME_FEATURES_PARQUET)
+    except Exception as e:  # pragma: no cover — corrupt cache
+        logger.warning(f"[pipeline] Could not read regime cache: {e}")
+        return {}
+    if "regime_label_smoothed" not in df.columns:
+        return {}
+    return compute_regime_stats(df["regime_label_smoothed"])
+
+
+def apply_regime_tilt(
+    profile:           ProfileAgentOutput,
+    macro:             MacroRegimeSnapshot,
+    pipeline_warnings: list[str],
+) -> tuple[ProfileAgentOutput, RebalanceEvaluation | None]:
+    """
+    Route the macro regime into the portfolio via the client's equity target.
+
+    Until this existed the Research Agent influenced nothing: run_allocation_agent
+    takes no macro argument, and MacroRegimeSnapshot.for_allocation() and
+    rebalance.evaluate_rebalance() both had zero callers. The regime reached the
+    compliance narrative and the final package, and moved no weight.
+
+    The tilt is applied here rather than inside the Allocation Agent because the
+    Allocation Agent already reads portfolio_equity_target off the profile, and
+    the orchestrator already owns input assembly — so macro reaches allocation
+    through a field the optimizer respects, with no change to Aidan's signature
+    and no quantitative decision made in this module. evaluate_rebalance() decides
+    whether to move; regime_tilt() sizes the move; this function only carries the
+    result.
+
+    Only a JUSTIFIED decision applies the tilt. That is the point of
+    RebalanceEvaluation: the smoothed 1995-2025 label path contains 18 runs with a
+    median length of 5 months, so acting on regime_change_detected alone would
+    trade the book on classifier noise. Every non-JUSTIFIED verdict is recorded in
+    pipeline_warnings with its explanation, so a no-op is visible rather than
+    silent.
+
+    Returns (profile, evaluation). `profile` is a copy with the tilted target when
+    the tilt applied, and the original object otherwise.
+    """
+    if macro.regime_change_evidence is None:
+        msg = (
+            "Regime tilt skipped — snapshot carries no regime_change_evidence "
+            "(build_snapshot was called without PELT break_dates)"
+        )
+        logger.info(f"[pipeline] {msg}")
+        pipeline_warnings.append(msg)
+        return profile, None
+
+    regime_stats = _load_regime_stats()
+    evaluation   = evaluate_rebalance(macro, profile, regime_stats)
+
+    if evaluation.decision != RebalanceDecision.JUSTIFIED:
+        msg = f"Regime tilt not applied ({evaluation.decision.value}): {evaluation.explanation}"
+        logger.info(f"[pipeline] {msg}")
+        pipeline_warnings.append(msg)
+        return profile, evaluation
+
+    # The tilt is a RELATIVE adjustment (±TILT_CAP as a fraction of the target),
+    # so it is applied multiplicatively in whatever units the field already holds.
+    # RebalanceEvaluation.proposed_equity_target is deliberately NOT used here:
+    # rebalance.to_financial_units() converts it to FINANCIAL-wealth units and
+    # clips to [0, 1], while ProfileAgentOutput.portfolio_equity_target is in
+    # TOTAL-WEALTH units (effective_risk_budget − implicit_equity_exposure).
+    # Assigning one to the other would be a unit error that no validator catches.
+    base = profile.portfolio_equity_target
+    if base is None:
+        base = profile.effective_risk_budget - profile.implicit_equity_exposure
+
+    tilt   = regime_tilt(regime_stats, macro.regime_label)
+    tilted = base * (1.0 + tilt)
+
+    # model_copy does not re-run validators, which is safe here: none of
+    # ProfileAgentOutput's four model_validators reference portfolio_equity_target.
+    profile = profile.model_copy(update={"portfolio_equity_target": tilted})
+
+    msg = (
+        f"Regime tilt applied ({evaluation.prior_regime} → {evaluation.current_regime}): "
+        f"equity target {base:+.4f} → {tilted:+.4f} ({tilt:+.1%} tilt)"
+    )
+    logger.info(f"[pipeline] {msg}")
+    pipeline_warnings.append(msg)
+    return profile, evaluation
+
+
 def assemble_compliance_input(
     profile:  ProfileAgentOutput,
     macro:    MacroRegimeSnapshot,
@@ -194,6 +317,11 @@ def run_pipeline(
 
     # Step 2 — Discount rate
     discount_rate = latest_dgs10(fred_api_key=fred_api_key, fallback=0.044)
+
+    # Step 2b — Regime tilt. Must precede the allocation loop: it adjusts the
+    # equity target the optimizer caps its risky weight at, so applying it after
+    # would leave the allocation built on the untilted target.
+    profile, _rebalance_evaluation = apply_regime_tilt(profile, macro, pipeline_warnings)
 
     # Step 3 — Allocation ↔ Risk loop
     alloc_output, risk_output, risk_ao, alloc_ao, risk_revisions = run_alloc_risk_loop(
