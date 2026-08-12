@@ -491,6 +491,20 @@ def build_profile_from_intake(
         llm_role  = _llm_role_for(extracted.extractor),
     )
     result.profile = to_profile_agent_output(profile_dict)
+
+    # Carry the classified statements onto the profile itself, not just onto this
+    # BridgeResult. Without this line the mandate stops here: the orchestrator
+    # builds ComplianceInput from ProfileAgentOutput (never from BridgeResult), so
+    # Compliance Job 3.2 receives an empty client_statements list and reports every
+    # exclusion check as passing — the vacuous-pass failure mode, which looks
+    # identical to a genuine pass in the report.
+    #
+    # Assigned rather than passed through build_profile() because statements are
+    # not an input to any formula: build_profile computes numbers, and a mandate
+    # ("no weapons") has no place in that signature. None of
+    # ProfileAgentOutput's four model_validators reference client_statements, so
+    # assigning post-construction cannot invalidate the object.
+    result.profile.client_statements = list(extracted.statements)
     return result
 
 
