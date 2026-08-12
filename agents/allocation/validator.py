@@ -93,7 +93,7 @@ def validate_sleeve(
     for t, w in weights.items():
         lim = single_name_limits.get(t, SINGLE_NAME_LIMIT)
         if w > lim + 1e-9:
-            violations.append(f"{t}: weight {w:.1%} exceeds single-name limit {lim:.1%}")
+            violations.append(f"{t}: weight {w:.3%} exceeds single-name limit {lim:.3%}")
 
     # ── Employer stock — never hold the client's own employer; it's already
     #    carried via career + equity comp ──
@@ -121,6 +121,6 @@ def validate_sleeve(
         lim = sector_limits.get(sec, SECTOR_LIMIT)
         if w > lim + 1e-9:
             reason = " (client's own employer sector)" if sec == employer_sector else ""
-            violations.append(f"{sec} sector{reason}: {w:.1%} exceeds limit {lim:.1%}")
+            violations.append(f"{sec} sector{reason}: {w:.3%} exceeds limit {lim:.3%}")
 
     return violations

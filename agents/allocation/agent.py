@@ -135,7 +135,15 @@ def _build_portfolio_prompt(
     ]
 
     for fc in flag_constraints:
-        lines.append(f"  - [Risk Agent tightened this] {fc.constraint_type.value} {fc.target}: <= {fc.limit:.1%}")
+        # Shown at 3dp because the validator compares at full precision against
+        # fc.limit * 0.99. At 1dp a cap of 0.081135 renders as "8.1%", the model
+        # proposes 0.0812, and the rejection reads "8.1% exceeds limit 8.1%" —
+        # an instruction it cannot act on. Display precision has to exceed the
+        # granularity of the decision being asked for.
+        lines.append(
+            f"  - [Risk Agent tightened this] {fc.constraint_type.value} {fc.target}: "
+            f"<= {fc.limit * 0.99:.3%}"
+        )
 
     lines += [
         "",
@@ -172,13 +180,77 @@ def _build_portfolio_prompt(
     return "\n".join(lines)
 
 
+_MAX_RESPONSE_TOKENS = 16000
+"""
+Output ceiling for the sleeve proposal.
+
+Sized to the universe, not picked round. The response is one JSON object holding a
+weight AND a client-specific rationale for every instrument: at 38 instruments
+that is ~38 x (12 tokens of weight + ~60 tokens of prose) plus scaffolding, so the
+previous 2000-token ceiling truncated mid-string and surfaced as
+"response was not valid JSON: Unterminated string" — a parse error that says
+nothing about the real cause. Only tokens actually generated are billed, so the
+headroom is free; 16000 also keeps a non-streaming request inside the SDK's HTTP
+timeout. Raise this if the universe grows past ~100 instruments.
+"""
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """
+    First balanced {...} object in `text`, or None.
+
+    Brace-matched rather than regex-based because the payload contains nested
+    objects ("weights" and "rationale"), and a non-greedy regex stops at the
+    first inner closing brace. Quote-aware so a brace inside a rationale string
+    cannot unbalance the scan.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth, in_string, escaped = 0, False, False
+    for i, ch in enumerate(text[start:], start):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
 def _call_llm_for_sleeve(prompt: str) -> tuple[dict[str, float], dict[str, str]]:
     message = _client.messages.create(
         model       = _MODEL,
-        max_tokens  = 2000,
+        max_tokens  = _MAX_RESPONSE_TOKENS,
         temperature = 0,
         messages    = [{"role": "user", "content": prompt}],
     )
+
+    # Check before parsing. A truncated response is still syntactically a string,
+    # so json.loads() fails with a position error that reads like a model mistake
+    # and sends the retry loop back to the LLM three times for something no
+    # re-prompt can fix.
+    if message.stop_reason == "max_tokens":
+        raise ValueError(
+            f"response hit the {_MAX_RESPONSE_TOKENS}-token ceiling and was cut off "
+            f"mid-JSON — raise _MAX_RESPONSE_TOKENS; the universe is likely larger "
+            f"than the ceiling was sized for"
+        )
+
     text = message.content[0].text.strip()
     if text.startswith("```"):
         text = text.strip("`")
@@ -189,7 +261,17 @@ def _call_llm_for_sleeve(prompt: str) -> tuple[dict[str, float], dict[str, str]]
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
-        raise ValueError(f"response was not valid JSON: {e}") from e
+        # Fall back to extracting the outermost JSON object. When the sleeve is
+        # hard to solve the model narrates its reasoning first ("I need to fix
+        # these violations: ...") and only then emits the object; json.loads then
+        # fails at char 0 on a response that does contain a perfectly good answer.
+        # That failure previously consumed a revision AND replaced the real
+        # violation list with a parse error, so the next prompt lost the
+        # constraint feedback and the loop could not recover.
+        obj = _extract_json_object(text)
+        if obj is None:
+            raise ValueError(f"response was not valid JSON: {e}") from e
+        parsed = obj
 
     if "weights" not in parsed or "rationale" not in parsed:
         raise ValueError("response JSON must have 'weights' and 'rationale' keys")
