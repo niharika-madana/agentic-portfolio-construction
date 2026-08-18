@@ -1,0 +1,49 @@
+DISCOVERY CALL — intake notes (raw, unedited)
+Advisor: J. Okafor   |   Prospective client: Priya Raman   |   45 min, phone
+
+Priya reached out through the Friday referral. Below is roughly how the
+conversation went — dumping it here before I forget the details, will clean up
+into the system later.
+
+She's 47, lives in Boston. Works as VP of Clinical Development at a mid-cap
+biotech — the company is publicly traded (ticker ARVX). She's been there almost
+nine years, came over from a big pharma. Says she "thinks like a scientist, not
+a markets person," so she wants someone else handling the portfolio.
+
+On comp: base salary is $310,000. On top of that there's a target cash bonus
+around 25% but she was very clear it's "all over the place year to year" —
+some years it's basically zero if a trial readout goes badly, other years it's
+well above target. The bigger piece is equity. She gets a large annual RSU grant
+plus options, and between vesting and the bonus swings she figures her total comp
+averages out to somewhere around $430,000 a year. I'd call her income pretty
+equity-like and frankly tied to how biotech as a sector trades — when the sector
+sells off, her paper wealth AND her bonus both get hit at the same time. When I
+floated that her income basically moves more than one-for-one with the biotech
+sector (I said think of it like a beta of about 1.2 to equities), she agreed that
+sounded right, maybe even a touch high in a bad year.
+
+She doesn't expect huge raises from here — she's senior already. Maybe 3% a year
+real growth, "cost of living plus a little." Wants to keep working until about 63,
+then step back, though she said she might consult after that.
+
+Holdings (she read these off her latest statements):
+  - ARVX (her own company stock, from vested RSUs she never sold): about $360,000.
+    She KNOWS this is a lot in one name, feels nervous about it, hasn't done
+    anything about it. Flag this.
+  - A total-market index fund (VTI): around $250,000.
+  - International index (VXUS): about $85,000.
+  - A bond fund (BND): roughly $120,000.
+  - Cash sitting in savings / money market: about $90,000. Says it's "too much
+    just sitting there" but it's her comfort buffer.
+
+Risk: describes herself as middle-of-the-road. Not a gambler, not ultra-cautious.
+"I don't want to lose half my money, but I'm not retiring tomorrow either." I'd
+put her at a moderate risk tolerance. The bigger issue is she's already hugely
+exposed to biotech through both her job and the ARVX position — she doesn't
+really see that the paycheck itself is a concentrated bet.
+
+No kids. Owns her condo (not counting it as investable). Spouse has a separate,
+stable income — we're only advising on her assets for now.
+
+TODO: build her profile, run the human-capital decomposition, and SHOW her how
+much biotech risk she's carrying before she even opens a brokerage account.

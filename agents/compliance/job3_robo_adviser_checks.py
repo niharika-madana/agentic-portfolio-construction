@@ -74,13 +74,65 @@ DISCLOSURE_CONFIDENCE_FLOOR = 0.50
 # on the Allocation Agent's internals to audit the Allocation Agent's output)
 # ---------------------------------------------------------------------------
 
+# ticker → GICS sector for the single-name universe. Compliance's own copy, on
+# purpose: importing agents/allocation/adapters.ETF_SECTORS would mean auditing
+# the Allocation Agent against its own definition of the truth, which is not an
+# audit. The cost of that independence is that this map has to be updated when
+# the universe changes — see _UNCLASSIFIED_WEIGHT_FLOOR for the guard that makes
+# a stale copy fail loudly instead of silently.
+_TICKER_SECTOR: dict[str, str] = {
+    "GOOGL": "Communication Services", "META": "Communication Services", "NFLX": "Communication Services",
+    "AMZN": "Consumer Discretionary",  "TSLA": "Consumer Discretionary",  "HD":   "Consumer Discretionary",
+    "WMT":  "Consumer Staples",        "COST": "Consumer Staples",        "PG":   "Consumer Staples",
+    "XOM":  "Energy",                  "CVX":  "Energy",                  "COP":  "Energy",
+    "BRK":  "Financials",              "JPM":  "Financials",              "V":    "Financials",
+    "LLY":  "Health Care",             "JNJ":  "Health Care",             "UNH":  "Health Care",
+    "GE":   "Industrials",             "CAT":  "Industrials",             "HON":  "Industrials",
+    "NVDA": "Information Technology",  "MSFT": "Information Technology",  "AAPL": "Information Technology",
+    "SHW":  "Materials",               "ECL":  "Materials",               "APD":  "Materials",
+    "AMT":  "Real Estate",             "WELL": "Real Estate",             "SPG":  "Real Estate",
+    "NEE":  "Utilities",               "SO":   "Utilities",               "DUK":  "Utilities",
+}
+
 _EQUITY_ETFS: set[str] = {
+    # Single names — the current universe.
+    *_TICKER_SECTOR,
+    # ETF-era instruments. Retained because they remain correct classifications
+    # and because a mixed or reverted universe must still audit cleanly; the
+    # equity share is a weight sum, so entries for instruments nobody holds
+    # contribute nothing.
     "SPY", "IWM", "EFA", "EEM",                              # broad equity
     "XLK", "XLF", "XLV", "XLE", "XLI", "XLC", "XLY", "XLP",  # GICS sectors
     "XLU", "XLRE", "VNQ",                                    # utilities / real estate
 }
 _INCOME_ETFS: set[str] = {"AGG", "TLT", "IEF", "SHY", "HYG", "LQD", "TIP"}
 _BROAD_MARKET_ETFS: set[str] = {"SPY", "IWM", "EFA", "EEM"}
+"""
+Instruments whose holdings are not knowable from the ticker alone.
+
+Empty in practice under the single-name universe, and that is the correct
+result rather than a gap: a share of AAPL is technology exposure exactly once,
+so there is no hidden spillover for Check 3.3 to disclose. The set stays
+populated so a reverted or mixed universe is still screened.
+"""
+
+_UNCLASSIFIED_WEIGHT_FLOOR = 0.05
+"""
+Portfolio weight in instruments Compliance cannot classify before Check 3.1
+refuses to opine.
+
+This exists because of a real failure: when the universe moved from 24 ETFs to
+33 single names, the classification sets above still held only ETF tickers, so
+`equity_w` summed to exactly 0.0 for every client and Check 3.1 reported
+"equity share 0% is below the 30% floor" against portfolios that were in fact
+almost entirely equity. Eight false MEDIUM violations, and nothing in the output
+distinguished them from real ones — the check was confidently wrong rather than
+unable to answer.
+
+A compliance check that cannot classify what it is auditing must say so. Below
+this floor the unknown weight cannot move the equity share across a band
+boundary, so the opinion still stands.
+"""
 
 # Free-text mandate subject → the sector ETF that would directly express it.
 # A subject that maps to nothing here (e.g. "weapons", "tobacco") has no pure
@@ -97,6 +149,38 @@ _SECTOR_ETF: dict[str, str] = {
     "consumer staples": "XLP",
     "utilities": "XLU",
     "real estate": "XLRE", "reit": "XLRE",
+}
+
+# Free-text mandate subject → canonical GICS sector, for the single-name path in
+# Check 3.2. Parallel to _SECTOR_ETF above, which answers the same question for
+# an ETF universe ("which fund expresses this?"); this one answers "which sector
+# did they mean?", after which _TICKER_SECTOR finds every held name in it.
+#
+# The client's words are not GICS vocabulary — "oil", "fossil fuels" and "gas"
+# all mean Energy, and a mandate that misses because the client said "oil"
+# instead of "Energy" is a silent compliance failure, which is the whole class of
+# bug Check 3.2 exists to prevent.
+_SUBJECT_SECTOR: dict[str, str] = {
+    "information technology": "Information Technology", "technology": "Information Technology",
+    "tech": "Information Technology", "big tech": "Information Technology",
+    "semiconductors": "Information Technology", "software": "Information Technology",
+    "financials": "Financials", "finance": "Financials", "banks": "Financials",
+    "banking": "Financials", "financial services": "Financials", "insurers": "Financials",
+    "health care": "Health Care", "healthcare": "Health Care", "pharma": "Health Care",
+    "pharmaceutical": "Health Care", "pharmaceuticals": "Health Care", "biotech": "Health Care",
+    "energy": "Energy", "oil": "Energy", "oil and gas": "Energy", "gas": "Energy",
+    "fossil": "Energy", "fossil fuels": "Energy", "fossil fuel": "Energy",
+    "petroleum": "Energy", "hydrocarbons": "Energy", "coal": "Energy",
+    "industrials": "Industrials", "manufacturing": "Industrials", "defense": "Industrials",
+    "defence": "Industrials", "aerospace": "Industrials",
+    "communication services": "Communication Services", "communications": "Communication Services",
+    "media": "Communication Services", "social media": "Communication Services",
+    "consumer discretionary": "Consumer Discretionary", "retail": "Consumer Discretionary",
+    "consumer staples": "Consumer Staples", "tobacco": "Consumer Staples",
+    "alcohol": "Consumer Staples",
+    "utilities": "Utilities", "materials": "Materials", "chemicals": "Materials",
+    "mining": "Materials",
+    "real estate": "Real Estate", "reit": "Real Estate", "reits": "Real Estate",
 }
 
 # ticker → issuer, for the conflict-of-interest screen (Check 3.4).
@@ -186,6 +270,37 @@ def check_composition_objective(
 
     equity_w = sum(w for t, w in portfolio.items() if t in _EQUITY_ETFS)
     income_w = sum(w for t, w in portfolio.items() if t in _INCOME_ETFS)
+
+    # Refuse to opine on a portfolio Compliance cannot classify. Without this,
+    # an instrument missing from the classification sets is silently treated as
+    # non-equity, so a stale map reads as "0% equity" — an assertion about the
+    # portfolio rather than an admission about the map. See
+    # _UNCLASSIFIED_WEIGHT_FLOOR.
+    unclassified = {
+        t: w for t, w in portfolio.items()
+        if t not in _EQUITY_ETFS and t not in _INCOME_ETFS and t not in _ETF_ISSUER
+    }
+    unclassified_w = sum(unclassified.values())
+    if unclassified_w > _UNCLASSIFIED_WEIGHT_FLOOR:
+        violations.append(ComplianceViolation(
+            check             = check,
+            severity          = Severity.MEDIUM,
+            description       = (
+                f"{unclassified_w:.0%} of the portfolio is in instruments Compliance "
+                f"cannot classify as equity or income ({', '.join(sorted(unclassified))}), "
+                f"so composition cannot be checked against the '{objective}' objective. "
+                f"This indicates the Compliance universe map is stale relative to the "
+                f"Allocation Agent's universe, not that the portfolio is defective."
+            ),
+            rule_reference    = _IM_2017_02,
+            responsible_agent = ResponsibleAgent.COMPLIANCE.value,
+            action_required   = (
+                "Update _TICKER_SECTOR / _EQUITY_ETFS / _INCOME_ETFS in "
+                "job3_robo_adviser_checks.py to cover the current asset universe, "
+                "then re-run compliance."
+            ),
+        ))
+        return violations, passed
 
     band = _OBJECTIVE_EQUITY_BANDS.get(objective)
     if band is not None:
@@ -279,7 +394,7 @@ def _deterministic_findings(
             ))
             continue
 
-        # 2. Direct: the client named a sector whose ETF the portfolio holds.
+        # 2a. Direct: the client named a sector whose ETF the portfolio holds.
         sector_etf = _SECTOR_ETF.get(subj_lower)
         if sector_etf and sector_etf in held:
             findings.append(MandateFinding(
@@ -291,6 +406,27 @@ def _deterministic_findings(
                 ),
             ))
             continue
+
+        # 2b. Direct: the client named a sector and the portfolio holds single
+        #     names in it. Under an all-ETF universe a sector exclusion had one
+        #     proxy to find; under a single-name universe it has several, and
+        #     each held name is its own breach — "no oil and gas" against a book
+        #     holding XOM, CVX and COP is three excluded positions, not one.
+        #     Reported per ticker so the remediation names what to sell.
+        sector = _SUBJECT_SECTOR.get(subj_lower)
+        if sector:
+            in_sector = sorted(t for t in held if _TICKER_SECTOR.get(t) == sector)
+            if in_sector:
+                for ticker in in_sector:
+                    findings.append(MandateFinding(
+                        ticker=ticker, subject=subject, quote=s.quote,
+                        directness="direct",
+                        reason=(
+                            f"Portfolio holds {ticker}, a {sector} name, which falls "
+                            f"inside the '{subject}' exposure the client excluded."
+                        ),
+                    ))
+                continue
 
         # 3. Indirect: no direct proxy held, but broad-market equity may contain
         #    the excluded issuer/sector (e.g. SPY holds defense names).
