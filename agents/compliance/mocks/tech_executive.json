@@ -1,0 +1,50 @@
+{
+    "client_profile": {
+        "persona": "tech_executive",
+        "age": 42,
+        "risk_tolerance": "moderate",
+        "time_horizon_years": 15,
+        "liquidity_needs": "low",
+        "investment_objective": "growth"
+    },
+    "human_capital": {
+        "industry": "technology",
+        "income_stability": "low",
+        "income_equity_correlation": 0.75,
+        "rsu_concentration": 0.40,
+        "human_capital_type": "equity-like",
+        "employer_sector": "technology",
+        "has_pension": false,
+        "estimated_hc_pv": 2500000.0
+    },
+    "macro_regime": {
+        "current_regime": "rate_hike",
+        "historical_analogue": "2004-2006",
+        "regime_risk_flags": ["rising rates", "tech multiple compression"],
+        "regime_confidence": 0.82,
+        "regime_volatility": "high"
+    },
+    "proposed_portfolio": {
+        "AAPL": 0.15,
+        "QQQ": 0.20,
+        "BND": 0.10,
+        "VTI": 0.25,
+        "NVDA": 0.20,
+        "CASH": 0.10
+    },
+    "allocation_rationale": {
+        "AAPL": "Large cap tech with stable cash flows and consistent dividend growth",
+        "QQQ": "Broad tech exposure for long-term capital appreciation",
+        "BND": "Fixed income allocation for portfolio stability",
+        "VTI": "Broad market diversification across all US sectors",
+        "NVDA": "AI infrastructure beneficiary with strong earnings trajectory",
+        "CASH": "Liquidity buffer for near-term needs"
+    },
+    "regime_change_flag": {
+        "detected": true,
+        "prior_regime": "ai_boom",
+        "current_regime": "rate_hike",
+        "shift_date": "2026-03-15",
+        "rebalance_proposed": null
+    }
+}

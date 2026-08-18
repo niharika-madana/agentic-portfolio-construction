@@ -1,0 +1,46 @@
+{
+    "client_profile": {
+        "persona": "biology_professor",
+        "age": 55,
+        "risk_tolerance": "conservative",
+        "time_horizon_years": 8,
+        "liquidity_needs": "medium",
+        "investment_objective": "preservation"
+    },
+    "human_capital": {
+        "industry": "education",
+        "income_stability": "high",
+        "income_equity_correlation": 0.10,
+        "rsu_concentration": 0.00,
+        "human_capital_type": "bond-like",
+        "employer_sector": "education",
+        "has_pension": true,
+        "estimated_hc_pv": 1200000.0
+    },
+    "macro_regime": {
+        "current_regime": "rate_hike",
+        "historical_analogue": "2004-2006",
+        "regime_risk_flags": ["rising rates"],
+        "regime_confidence": 0.78,
+        "regime_volatility": "medium"
+    },
+    "proposed_portfolio": {
+        "VTI": 0.20,
+        "VXUS": 0.10,
+        "BND": 0.30,
+        "TIP": 0.15,
+        "VNQ": 0.10,
+        "CASH": 0.15
+    },
+    "allocation_rationale": {
+        "VTI": "Conservative equity exposure for modest growth, suitable for preservation-focused biology professor with bond-like human capital and 8-year horizon",
+        "VXUS": "International diversification reduces domestic concentration risk for conservative client",
+        "BND": "Core fixed income holding providing stability and income, complementing client's bond-like human capital without over-concentrating in bonds",
+        "TIP": "Inflation-protected bonds hedge purchasing power risk for a client approaching retirement within 8 years",
+        "VNQ": "Real estate exposure provides diversification uncorrelated with education sector income",
+        "CASH": "Higher cash allocation reflecting medium liquidity needs and conservative risk tolerance"
+    },
+    "regime_change_flag": {
+        "detected": false
+    }
+}

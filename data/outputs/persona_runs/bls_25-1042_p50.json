@@ -1,0 +1,124 @@
+{
+  "client_id": "bls_25-1042_p50",
+  "career_type": "Academia",
+  "age": 47,
+  "profile": {
+    "financial_capital": 200000.0,
+    "human_capital": 1095154.68,
+    "hc_over_fc": 5.4757734,
+    "hc_pct_of_total": 84.6,
+    "income_sigma": 0.05,
+    "income_corr": 0.1,
+    "income_beta": 0.0318,
+    "hc_type": "bond-like",
+    "income_stability": "high",
+    "implicit_equity_exposure": 0.027,
+    "effective_risk_budget": 0.958,
+    "portfolio_equity_target": 0.931,
+    "employer_sector": "Education",
+    "risk_tolerance": "moderate",
+    "objective": "growth",
+    "horizon_years": 18,
+    "rsu_concentration": 0.0,
+    "has_pension": true
+  },
+  "allocation": {
+    "n_funded": 26,
+    "n_universe": 26,
+    "top_holdings": [
+      [
+        "ECL",
+        0.06499999999999997
+      ],
+      [
+        "GOOGL",
+        0.06199999999999997
+      ],
+      [
+        "AMZN",
+        0.06199999999999997
+      ],
+      [
+        "NVDA",
+        0.06199999999999997
+      ],
+      [
+        "AAPL",
+        0.06199999999999997
+      ],
+      [
+        "HD",
+        0.06099999999999997
+      ],
+      [
+        "NFLX",
+        0.04899999999999998
+      ],
+      [
+        "LQD",
+        0.04599999999999998
+      ]
+    ],
+    "sector_weights": {
+      "Consumer Discretionary": 0.16399999999999992,
+      "Information Technology": 0.15899999999999992,
+      "Communication Services": 0.14599999999999994,
+      "Materials": 0.11099999999999996,
+      "Financials": 0.09599999999999996,
+      "Fixed Income": 0.07899999999999996,
+      "Health Care": 0.07399999999999997,
+      "Consumer Staples": 0.07299999999999998,
+      "Industrials": 0.07299999999999997,
+      "Real Estate": 0.016999999999999994,
+      "Energy": 0.007999999999999997
+    },
+    "employer_sector_weight": 0.0,
+    "unique_rationales": 26,
+    "n_rationales": 26
+  },
+  "risk": {
+    "decision": "APPROVE",
+    "revisions": 2,
+    "vol_annual": 0.0750850021163502,
+    "market_regime": "normal",
+    "position_limits_passed": 38,
+    "position_limits_total": 38,
+    "sector_limits_passed": 13,
+    "sector_limits_total": 13,
+    "regimes_passed": 5,
+    "regimes_total": 5,
+    "violations": [],
+    "derivation": {
+      "drawdown_method": "benchmark_relative_per_regime",
+      "concentration_method": "marginal_risk_contribution",
+      "sector_method": "static_lookup"
+    }
+  },
+  "compliance": {
+    "status": "PASS",
+    "clearance": true,
+    "overall_severity": "NONE",
+    "revisions": 0,
+    "passed_total": 20,
+    "jobs": {
+      "job1": {
+        "passed": 9,
+        "violations": 0
+      },
+      "job2": {
+        "passed": 7,
+        "violations": 0
+      },
+      "job3": {
+        "passed": 4,
+        "violations": 0
+      }
+    },
+    "violations": [],
+    "routed_to": {}
+  },
+  "warnings": [
+    "Regime tilt not applied (no_change): No regime change: Late-Cycle Expansion has held for 29 months. No rebalance evaluated.",
+    "Risk Agent required 2 FLAG revision(s)"
+  ]
+}

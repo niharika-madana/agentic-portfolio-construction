@@ -1,0 +1,131 @@
+{
+  "client_id": "bls_11-2022_p50",
+  "career_type": "Sales",
+  "age": 44,
+  "profile": {
+    "financial_capital": 90000.0,
+    "human_capital": 1958389.08,
+    "hc_over_fc": 21.75987866666667,
+    "hc_pct_of_total": 95.6,
+    "income_sigma": 0.4,
+    "income_corr": 0.75,
+    "income_beta": 1.9096,
+    "hc_type": "equity-like",
+    "income_stability": "low",
+    "implicit_equity_exposure": 1.826,
+    "effective_risk_budget": 0.618,
+    "portfolio_equity_target": -1.208,
+    "employer_sector": "Consumer Discretionary",
+    "risk_tolerance": "aggressive",
+    "objective": "growth",
+    "horizon_years": 21,
+    "rsu_concentration": 0.0,
+    "has_pension": false
+  },
+  "allocation": {
+    "n_funded": 21,
+    "n_universe": 21,
+    "top_holdings": [
+      [
+        "NVDA",
+        0.09999999999999996
+      ],
+      [
+        "AAPL",
+        0.09999999999999996
+      ],
+      [
+        "GOOGL",
+        0.09999999999999996
+      ],
+      [
+        "COST",
+        0.08999999999999996
+      ],
+      [
+        "BRK",
+        0.06999999999999998
+      ],
+      [
+        "META",
+        0.05999999999999997
+      ],
+      [
+        "V",
+        0.04999999999999998
+      ],
+      [
+        "NFLX",
+        0.03999999999999998
+      ]
+    ],
+    "sector_weights": {
+      "Information Technology": 0.19999999999999993,
+      "Communication Services": 0.1999999999999999,
+      "Financials": 0.15999999999999995,
+      "Consumer Staples": 0.12999999999999995,
+      "Health Care": 0.08999999999999996,
+      "Energy": 0.049999999999999975,
+      "Materials": 0.049999999999999975,
+      "Real Estate": 0.03999999999999998,
+      "Industrials": 0.03999999999999998,
+      "Consumer Discretionary": 0.03999999999999998
+    },
+    "employer_sector_weight": 0.03999999999999998,
+    "unique_rationales": 21,
+    "n_rationales": 21
+  },
+  "risk": {
+    "decision": "APPROVE",
+    "revisions": 0,
+    "vol_annual": 0.0,
+    "market_regime": "normal",
+    "position_limits_passed": 38,
+    "position_limits_total": 38,
+    "sector_limits_passed": 13,
+    "sector_limits_total": 13,
+    "regimes_passed": 5,
+    "regimes_total": 5,
+    "violations": [],
+    "derivation": {
+      "drawdown_method": "benchmark_relative_per_regime",
+      "concentration_method": "marginal_risk_contribution",
+      "sector_method": "hc_correlation_adjusted"
+    }
+  },
+  "compliance": {
+    "status": "PASS_WITH_WARNINGS",
+    "clearance": true,
+    "overall_severity": "MEDIUM",
+    "revisions": 0,
+    "passed_total": 19,
+    "jobs": {
+      "job1": {
+        "passed": 9,
+        "violations": 0
+      },
+      "job2": {
+        "passed": 6,
+        "violations": 1
+      },
+      "job3": {
+        "passed": 4,
+        "violations": 0
+      }
+    },
+    "violations": [
+      {
+        "check": "check_2_5_volatility_suitability",
+        "severity": "MEDIUM",
+        "agent": "allocation_agent",
+        "description": "Annualised portfolio volatility 0.00% is below the suitability band [8%, 30%] for risk_tolerance='aggressive'. Portfolio risk is unnecessarily low for this client."
+      }
+    ],
+    "routed_to": {
+      "allocation_agent": 1
+    }
+  },
+  "warnings": [
+    "Regime tilt not applied (no_change): No regime change: Late-Cycle Expansion has held for 29 months. No rebalance evaluated."
+  ]
+}
